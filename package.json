@@ -2,7 +2,7 @@
   "name": "copilot-session-sync",
   "displayName": "Copilot Session Sync",
   "description": "Sync GitHub Copilot chat sessions across devices using a private GitHub repository with AES-256 encryption.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "arbob",
   "license": "MIT",
   "engines": {
