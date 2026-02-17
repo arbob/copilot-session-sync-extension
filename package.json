@@ -1,0 +1,112 @@
+{
+  "name": "copilot-session-sync",
+  "displayName": "Copilot Session Sync",
+  "description": "Sync GitHub Copilot chat sessions across devices using a private GitHub repository with AES-256 encryption.",
+  "version": "0.1.0",
+  "publisher": "arbob",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "copilot",
+    "sync",
+    "chat",
+    "session",
+    "github"
+  ],
+  "icon": "icon.png",
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "copilot-session-sync.syncNow",
+        "title": "Copilot Session Sync: Sync Now",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "copilot-session-sync.setPassphrase",
+        "title": "Copilot Session Sync: Set Encryption Passphrase"
+      },
+      {
+        "command": "copilot-session-sync.toggleWorkspace",
+        "title": "Copilot Session Sync: Toggle Sync for This Workspace"
+      },
+      {
+        "command": "copilot-session-sync.viewSyncStatus",
+        "title": "Copilot Session Sync: View Sync Status"
+      },
+      {
+        "command": "copilot-session-sync.resetSync",
+        "title": "Copilot Session Sync: Reset Sync State"
+      }
+    ],
+    "configuration": {
+      "title": "Copilot Session Sync",
+      "properties": {
+        "copilotSessionSync.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable or disable Copilot session sync."
+        },
+        "copilotSessionSync.syncIntervalMinutes": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "description": "How often to sync sessions (in minutes)."
+        },
+        "copilotSessionSync.excludedWorkspaces": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "List of workspace folder paths to exclude from sync."
+        },
+        "copilotSessionSync.maxSessionAgeDays": {
+          "type": "number",
+          "default": 90,
+          "minimum": 1,
+          "description": "Only sync sessions newer than this many days."
+        },
+        "copilotSessionSync.repoName": {
+          "type": "string",
+          "default": "copilot-session-sync",
+          "description": "Name of the private GitHub repo used for sync storage."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "test": "mocha ./out/test/**/*.test.js --timeout 10000",
+    "package": "vsce package",
+    "publish": "vsce publish"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.8",
+    "@types/mocha": "^10.0.6",
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/test-electron": "^2.3.8",
+    "@vscode/vsce": "^2.24.0",
+    "mocha": "^10.3.0",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0"
+  }
+}

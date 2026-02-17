@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a1a2e;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#16213e;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#6366f1;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#8b5cf6;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="sync" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#22d3ee;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#06b6d4;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  
+  <!-- Background rounded rectangle -->
+  <rect x="4" y="4" width="120" height="120" rx="24" ry="24" fill="url(#bg)" />
+  <rect x="4" y="4" width="120" height="120" rx="24" ry="24" fill="none" stroke="#6366f1" stroke-width="1.5" opacity="0.4" />
+  
+  <!-- Copilot-style glasses/visor -->
+  <!-- Left lens -->
+  <rect x="22" y="38" width="34" height="22" rx="11" ry="11" fill="url(#accent)" opacity="0.9" />
+  <rect x="26" y="42" width="26" height="14" rx="7" ry="7" fill="#1a1a2e" opacity="0.6" />
+  <!-- Shine on left lens -->
+  <ellipse cx="34" cy="46" rx="5" ry="3" fill="white" opacity="0.25" />
+  
+  <!-- Right lens -->
+  <rect x="72" y="38" width="34" height="22" rx="11" ry="11" fill="url(#accent)" opacity="0.9" />
+  <rect x="76" y="42" width="26" height="14" rx="7" ry="7" fill="#1a1a2e" opacity="0.6" />
+  <!-- Shine on right lens -->
+  <ellipse cx="84" cy="46" rx="5" ry="3" fill="white" opacity="0.25" />
+  
+  <!-- Bridge between lenses -->
+  <path d="M56 49 Q64 42 72 49" fill="none" stroke="url(#accent)" stroke-width="3" stroke-linecap="round" />
+  
+  <!-- Temple arms -->
+  <line x1="22" y1="49" x2="14" y2="46" stroke="url(#accent)" stroke-width="2.5" stroke-linecap="round" />
+  <line x1="106" y1="49" x2="114" y2="46" stroke="url(#accent)" stroke-width="2.5" stroke-linecap="round" />
+  
+  <!-- Sync arrows (circular) -->
+  <!-- Top arrow (clockwise) -->
+  <path d="M44 78 A22 22 0 0 1 84 78" fill="none" stroke="url(#sync)" stroke-width="3" stroke-linecap="round" />
+  <polygon points="84,78 78,72 80,82" fill="#22d3ee" />
+  
+  <!-- Bottom arrow (counter-clockwise) -->
+  <path d="M84 90 A22 22 0 0 1 44 90" fill="none" stroke="url(#sync)" stroke-width="3" stroke-linecap="round" />
+  <polygon points="44,90 50,96 48,86" fill="#22d3ee" />
+  
+  <!-- Small dots for "data" feel -->
+  <circle cx="58" cy="84" r="2" fill="#22d3ee" opacity="0.6" />
+  <circle cx="64" cy="81" r="1.5" fill="#8b5cf6" opacity="0.5" />
+  <circle cx="70" cy="84" r="2" fill="#22d3ee" opacity="0.6" />
+</svg>
