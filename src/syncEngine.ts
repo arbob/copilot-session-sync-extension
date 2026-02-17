@@ -449,6 +449,109 @@ export class SyncEngine {
     }
 
     this.log('Pull complete: ' + pullCount + ' sessions pulled.');
+
+    // Repair step: ensure all local session files in current workspace are indexed
+    // This handles files that were written but not properly indexed in previous syncs
+    await this.reindexCurrentWorkspace(currentWsId);
+  }
+
+  /**
+   * Re-index all session files in the current workspace.
+   * Ensures files that exist on disk are added to VS Code's session index.
+   */
+  private async reindexCurrentWorkspace(workspaceId: string): Promise<void> {
+    this.log('Re-indexing sessions in current workspace: ' + workspaceId);
+    let reindexedCount = 0;
+
+    try {
+      const fs = await import('fs');
+      const chatDir = path.join(
+        process.env.HOME || process.env.USERPROFILE || '',
+        '.config/Code/User/workspaceStorage',
+        workspaceId,
+        'chatSessions'
+      );
+
+      if (!fs.existsSync(chatDir)) {
+        return;
+      }
+
+      const files = fs.readdirSync(chatDir).filter(
+        (f: string) => f.endsWith('.json') || f.endsWith('.jsonl')
+      );
+
+      for (const file of files) {
+        const ext = path.extname(file);
+        const sessionId = path.basename(file, ext);
+        const filePath = path.join(chatDir, file);
+
+        try {
+          const content = fs.readFileSync(filePath, 'utf-8');
+          const meta = this.extractSessionMetadataFromContent(content, ext);
+
+          const session: CopilotSession = {
+            id: sessionId,
+            workspaceId: workspaceId,
+            workspacePath: '',
+            fileExtension: ext,
+            rawContent: content,
+            customTitle: meta.customTitle,
+            creationDate: meta.creationDate,
+            lastMessageDate: meta.lastMessageDate,
+          };
+
+          // addToSessionIndex is idempotent — it only adds if not already present
+          await this.sessionReader.addToSessionIndex(workspaceId, session);
+          reindexedCount++;
+        } catch (err) {
+          this.log('Failed to reindex session ' + sessionId + ': ' + (err instanceof Error ? err.message : String(err)));
+        }
+      }
+
+      this.log('Reindex complete: checked ' + reindexedCount + ' sessions.');
+    } catch (err) {
+      this.logError('Reindex failed', err);
+    }
+  }
+
+  /**
+   * Extract minimal metadata from session file content.
+   */
+  private extractSessionMetadataFromContent(
+    content: string,
+    ext: string
+  ): { customTitle: string; creationDate: number; lastMessageDate: number } {
+    const defaults = { customTitle: 'Synced Session', creationDate: 0, lastMessageDate: 0 };
+
+    try {
+      if (ext === '.jsonl') {
+        // Parse first line (kind=0 header)
+        const firstLine = content.split('\n')[0];
+        if (!firstLine) {
+          return defaults;
+        }
+        const header = JSON.parse(firstLine);
+        if (header.kind === 0 && header.data) {
+          return {
+            customTitle: header.data.customTitle || defaults.customTitle,
+            creationDate: header.data.creationDate || defaults.creationDate,
+            lastMessageDate: header.data.lastMessageDate || defaults.lastMessageDate,
+          };
+        }
+      } else {
+        // .json format
+        const data = JSON.parse(content);
+        return {
+          customTitle: data.customTitle || defaults.customTitle,
+          creationDate: data.creationDate || defaults.creationDate,
+          lastMessageDate: data.lastMessageDate || defaults.lastMessageDate,
+        };
+      }
+    } catch {
+      // Parse error — use defaults
+    }
+
+    return defaults;
   }
 
   /**
