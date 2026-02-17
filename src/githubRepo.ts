@@ -115,7 +115,9 @@ export class GitHubRepo {
       const msg = typeof data === 'object' && data !== null && 'message' in data
         ? (data as { message: string }).message
         : `HTTP ${response.status}`;
-      throw new Error(`GitHub API error: ${msg} (${method} ${endpoint})`);
+      const err = new Error(`GitHub API error: ${msg} (${method} ${endpoint})`);
+      (err as any).httpStatus = response.status;
+      throw err;
     }
 
     return { data, status: response.status };
@@ -201,27 +203,45 @@ export class GitHubRepo {
 
   /**
    * Create or update a single file in the repo.
+   * Retries up to 3 times on 409 SHA conflicts (re-fetches current SHA).
    */
   async putFile(filePath: string, content: string, message: string): Promise<string> {
-    // Check if file exists to get its SHA (required for updates)
-    const existing = await this.getFile(filePath);
-    const sha = existing?.sha;
+    const maxRetries = 3;
+    const encodedContent = Buffer.from(content).toString('base64');
 
-    const body: Record<string, string> = {
-      message,
-      content: Buffer.from(content).toString('base64'),
-    };
-    if (sha) {
-      body.sha = sha;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      // Fetch the current SHA right before each attempt
+      const existing = await this.getFile(filePath);
+      const sha = existing?.sha;
+
+      const body: Record<string, string> = {
+        message,
+        content: encodedContent,
+      };
+      if (sha) {
+        body.sha = sha;
+      }
+
+      try {
+        const { data } = await this.request<{ content: { sha: string } }>(
+          'PUT',
+          `/repos/${this.owner}/${this.repoName}/contents/${filePath}`,
+          body
+        );
+        return data.content.sha;
+      } catch (err: any) {
+        const is409 = err?.httpStatus === 409 || (err?.message?.includes('but expected'));
+        if (is409 && attempt < maxRetries) {
+          // SHA conflict — wait briefly then retry with fresh SHA
+          await new Promise((r) => setTimeout(r, 500 * attempt));
+          continue;
+        }
+        throw err;
+      }
     }
 
-    const { data } = await this.request<{ content: { sha: string } }>(
-      'PUT',
-      `/repos/${this.owner}/${this.repoName}/contents/${filePath}`,
-      body
-    );
-
-    return data.content.sha;
+    // Should not reach here, but satisfy TypeScript
+    throw new Error(`putFile failed after ${maxRetries} retries: ${filePath}`);
   }
 
   /**
@@ -329,27 +349,49 @@ export class GitHubRepo {
       }
     );
 
-    // 5. Create a new commit
-    const { data: newCommit } = await this.request<{ sha: string }>(
-      'POST',
-      `/repos/${this.owner}/${this.repoName}/git/commits`,
-      {
-        message,
-        tree: treeData.sha,
-        parents: [latestCommitSha],
-      }
-    );
+    // 5. Create a commit and update the ref, retrying if the ref moved
+    const maxRefRetries = 3;
+    let parentSha = latestCommitSha;
 
-    // 6. Update the branch reference
-    await this.request(
-      'PATCH',
-      `/repos/${this.owner}/${this.repoName}/git/refs/heads/${this.defaultBranch}`,
-      {
-        sha: newCommit.sha,
-      }
-    );
+    for (let attempt = 1; attempt <= maxRefRetries; attempt++) {
+      // Create a new commit pointing to the tree
+      const { data: newCommit } = await this.request<{ sha: string }>(
+        'POST',
+        `/repos/${this.owner}/${this.repoName}/git/commits`,
+        {
+          message,
+          tree: treeData.sha,
+          parents: [parentSha],
+        }
+      );
 
-    return newCommit.sha;
+      try {
+        // Update the branch reference
+        await this.request(
+          'PATCH',
+          `/repos/${this.owner}/${this.repoName}/git/refs/heads/${this.defaultBranch}`,
+          {
+            sha: newCommit.sha,
+          }
+        );
+        return newCommit.sha;
+      } catch (err: any) {
+        const isConflict = err?.httpStatus === 409 || err?.httpStatus === 422;
+        if (isConflict && attempt < maxRefRetries) {
+          // Ref moved since we read it — re-fetch the latest commit and retry
+          const { data: freshRef } = await this.request<{ object: { sha: string } }>(
+            'GET',
+            `/repos/${this.owner}/${this.repoName}/git/ref/heads/${this.defaultBranch}`
+          );
+          parentSha = freshRef.object.sha;
+          await new Promise((r) => setTimeout(r, 500 * attempt));
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    throw new Error('batchCommit: ref update failed after retries');
   }
 
   // ─── Directory Listing ────────────────────────────────────────────────────
