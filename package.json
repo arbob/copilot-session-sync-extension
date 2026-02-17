@@ -2,7 +2,7 @@
   "name": "copilot-session-sync",
   "displayName": "Copilot Session Sync",
   "description": "Sync GitHub Copilot chat sessions across devices using a private GitHub repository with AES-256 encryption.",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "publisher": "arbob",
   "license": "MIT",
   "engines": {
@@ -45,6 +45,10 @@
       {
         "command": "copilot-session-sync.resetSync",
         "title": "Copilot Session Sync: Reset Sync State"
+      },
+      {
+        "command": "copilot-session-sync.reindexSessions",
+        "title": "Copilot Session Sync: Reindex Sessions (fixes missing sessions)"
       }
     ],
     "configuration": {

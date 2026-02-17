@@ -458,6 +458,24 @@ export class SyncEngine {
   }
 
   /**
+   * Public method to reindex all sessions in the current workspace.
+   * Called by the "Reindex Sessions" command.
+   * Returns the number of sessions reindexed.
+   */
+  async reindexCurrentWorkspace(): Promise<number> {
+    const currentWsId = this.getCurrentWorkspaceStorageId();
+    if (!currentWsId) {
+      this.log('No workspace open — cannot reindex sessions.');
+      return 0;
+    }
+
+    this.log('Reindexing sessions in workspace: ' + currentWsId);
+    const count = await this.sessionReader.reindexWorkspace(currentWsId);
+    this.log('Reindex complete: ' + count + ' sessions processed.');
+    return count;
+  }
+
+  /**
    * Get the current workspace storage ID from the extension's storageUri.
    * storageUri path: .../workspaceStorage/<wsId>/<extensionId>/
    */

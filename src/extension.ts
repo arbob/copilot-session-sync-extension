@@ -92,6 +92,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     })
   );
 
+  context.subscriptions.push(
+    vscode.commands.registerCommand('copilot-session-sync.reindexSessions', async () => {
+      const confirm = await vscode.window.showInformationMessage(
+        'This will reindex all synced session files and reload VS Code to show them. Continue?',
+        { modal: true },
+        'Reindex & Reload'
+      );
+
+      if (confirm === 'Reindex & Reload') {
+        try {
+          const count = await syncEngine.reindexCurrentWorkspace();
+          outputChannel.appendLine(`Reindexed ${count} sessions. Reloading window...`);
+          // Give a brief moment for the database write to complete
+          await new Promise(resolve => setTimeout(resolve, 500));
+          await vscode.commands.executeCommand('workbench.action.reloadWindow');
+        } catch (err) {
+          vscode.window.showErrorMessage(
+            `Reindex failed: ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+      }
+    })
+  );
+
   // ─── Auto-initialize and start sync ────────────────────────────────────
   const config = vscode.workspace.getConfiguration('copilotSessionSync');
   if (config.get<boolean>('enabled', true)) {
