@@ -418,6 +418,23 @@ export class SessionReader {
     await fs.promises.writeFile(sessionPath, session.rawContent, 'utf-8');
   }
 
+  /**
+   * Build the vscode-chat-session resource URI for a session.
+   * Format: vscode-chat-session://local/{base64(sessionId)}
+   */
+  private sessionResourceUri(sessionId: string): string {
+    const encoded = Buffer.from(sessionId, 'utf-8').toString('base64');
+    return `vscode-chat-session://local/${encoded}`;
+  }
+
+  /**
+   * Update ALL session indices in state.vscdb so VS Code's chat panel shows the session.
+   *
+   * Three keys must be updated:
+   * 1. chat.ChatSessionStore.index — dict of session metadata (used by session store)
+   * 2. agentSessions.model.cache  — array of session models (used by the chat panel UI)
+   * 3. agentSessions.state.cache  — array of read-state entries (marks sessions as unread/read)
+   */
   async addToSessionIndex(workspaceId: string, session: CopilotSession): Promise<void> {
     const dbPath = path.join(this.workspaceStorageDir, workspaceId, 'state.vscdb');
 
@@ -426,6 +443,8 @@ export class SessionReader {
       const db = new Database(dbPath);
 
       try {
+        // ── 1. Update chat.ChatSessionStore.index ────────────────────────
+
         const row = db.prepare(
           "SELECT value FROM ItemTable WHERE key = 'chat.ChatSessionStore.index'"
         ).get() as { value: string } | undefined;
@@ -457,12 +476,91 @@ export class SessionReader {
             hasPendingEdits: false,
             isEmpty: false,
             isExternal: false,
-            lastResponseState: 0,
+            lastResponseState: 1,
           };
 
           db.prepare(
             "INSERT OR REPLACE INTO ItemTable (key, value) VALUES ('chat.ChatSessionStore.index', ?)"
           ).run(JSON.stringify(index));
+        }
+
+        // ── 2. Update agentSessions.model.cache ─────────────────────────
+
+        const resourceUri = this.sessionResourceUri(session.id);
+
+        const modelRow = db.prepare(
+          "SELECT value FROM ItemTable WHERE key = 'agentSessions.model.cache'"
+        ).get() as { value: string } | undefined;
+
+        let modelCache: any[] = [];
+        if (modelRow?.value) {
+          try {
+            const parsed = JSON.parse(modelRow.value);
+            if (Array.isArray(parsed)) {
+              modelCache = parsed;
+            }
+          } catch {
+            // Corrupted — start fresh
+          }
+        }
+
+        // Check if this session already exists in the model cache
+        const modelExists = modelCache.some(
+          (entry: any) => entry.resource === resourceUri
+        );
+
+        if (!modelExists) {
+          modelCache.push({
+            providerType: 'local',
+            providerLabel: 'Local',
+            resource: resourceUri,
+            icon: 'vm',
+            label: session.customTitle,
+            status: 1,
+            timing: {
+              created: session.creationDate,
+              lastRequestStarted: session.lastMessageDate,
+              lastRequestEnded: session.lastMessageDate,
+            },
+          });
+
+          db.prepare(
+            "INSERT OR REPLACE INTO ItemTable (key, value) VALUES ('agentSessions.model.cache', ?)"
+          ).run(JSON.stringify(modelCache));
+        }
+
+        // ── 3. Update agentSessions.state.cache ─────────────────────────
+
+        const stateRow = db.prepare(
+          "SELECT value FROM ItemTable WHERE key = 'agentSessions.state.cache'"
+        ).get() as { value: string } | undefined;
+
+        let stateCache: any[] = [];
+        if (stateRow?.value) {
+          try {
+            const parsed = JSON.parse(stateRow.value);
+            if (Array.isArray(parsed)) {
+              stateCache = parsed;
+            }
+          } catch {
+            // Corrupted — start fresh
+          }
+        }
+
+        const stateExists = stateCache.some(
+          (entry: any) => entry.resource === resourceUri
+        );
+
+        if (!stateExists) {
+          stateCache.push({
+            resource: resourceUri,
+            archived: false,
+            read: Date.now(),
+          });
+
+          db.prepare(
+            "INSERT OR REPLACE INTO ItemTable (key, value) VALUES ('agentSessions.state.cache', ?)"
+          ).run(JSON.stringify(stateCache));
         }
       } finally {
         db.close();
