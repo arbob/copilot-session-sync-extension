@@ -379,11 +379,10 @@ export class SyncEngine {
       remoteMap.set(id, entry);
     }
 
-    // 3. Compute local hashes
+    // 3. Compute local hashes (hash the raw file content, not a normalized form)
     const localHashes = new Map<string, string>();
     for (const [id, session] of localMap) {
-      const content = JSON.stringify(session);
-      localHashes.set(id, Encryption.hashContent(content));
+      localHashes.set(id, Encryption.hashContent(session.rawContent));
     }
 
     // 4. Resolve conflicts
@@ -419,33 +418,49 @@ export class SyncEngine {
 
     // Decrypt
     const decrypted = Encryption.decryptFromString(encryptedContent, this.passphrase!);
-    const session: CopilotSession = JSON.parse(decrypted);
+    const payload = JSON.parse(decrypted);
 
-    // Map the remote workspace ID to the local workspace ID
-    // The workspace ID is unique per VS Code installation, so we match by workspace path
+    // Check if this is the new format (has rawContent) or old format
+    if (!payload.rawContent) {
+      this.log(`Skipping session ${sessionId}: old format (pre-v0.2.0). Re-push from original device.`);
+      return;
+    }
+
+    // Build the session object
+    const session: CopilotSession = {
+      id: sessionId,
+      workspaceId: '', // will be resolved below
+      workspacePath: payload.workspacePath ?? entry.workspacePath,
+      fileExtension: payload.fileExtension ?? entry.fileExtension ?? '.jsonl',
+      rawContent: payload.rawContent,
+      customTitle: payload.customTitle ?? entry.customTitle ?? 'Synced Session',
+      creationDate: payload.creationDate ?? entry.creationDate ?? 0,
+      lastMessageDate: payload.lastMessageDate ?? entry.lastMessageDate ?? 0,
+    };
+
+    // Map the remote workspace path to the local workspace ID
     const localWorkspaceId = await this.sessionReader.findLocalWorkspaceId(session.workspacePath);
 
     if (localWorkspaceId) {
-      // Found a matching local workspace — write the session there
       this.log(`Mapped remote workspace "${session.workspacePath}" to local ID: ${localWorkspaceId}`);
       session.workspaceId = localWorkspaceId;
     } else {
-      // No matching local workspace found — try the currently open workspace as fallback
+      // Fall back to currently open workspace
       const currentWsId = await this.sessionReader.getCurrentWorkspaceId();
       if (currentWsId) {
         this.log(`No local workspace match for "${session.workspacePath}" — writing to current workspace: ${currentWsId}`);
         session.workspaceId = currentWsId;
       } else {
-        this.log(`No matching workspace found for "${session.workspacePath}" — skipping session "${session.customTitle}". Open that workspace folder first.`);
+        this.log(`No matching workspace found for "${session.workspacePath}" — skipping session "${session.customTitle}".`);
         return;
       }
     }
 
-    // Write to local storage
+    // Write raw content to local storage
     await this.sessionReader.writeSession(session);
 
     // Update session index in state.vscdb
-    await this.sessionReader.addToSessionIndex(session.workspaceId, sessionId);
+    await this.sessionReader.addToSessionIndex(session.workspaceId, session);
   }
 
   /**
@@ -489,11 +504,10 @@ export class SyncEngine {
       remoteMap.set(id, entry);
     }
 
-    // 4. Compute local hashes
+    // 4. Compute local hashes (hash the raw file content)
     const localHashes = new Map<string, string>();
     for (const [id, session] of localMap) {
-      const content = JSON.stringify(session);
-      localHashes.set(id, Encryption.hashContent(content));
+      localHashes.set(id, Encryption.hashContent(session.rawContent));
     }
 
     // 5. Resolve conflicts
@@ -506,9 +520,17 @@ export class SyncEngine {
     for (const [sessionId, action] of actions) {
       if (action.action === 'push' || action.action === 'new-local') {
         const session = localMap.get(sessionId)!;
-        const content = JSON.stringify(session);
-        const encrypted = Encryption.encryptToString(content, this.passphrase!);
-        const contentHash = Encryption.hashContent(content);
+        // Store raw content + metadata in the encrypted payload
+        const payload = JSON.stringify({
+          rawContent: session.rawContent,
+          fileExtension: session.fileExtension,
+          workspacePath: session.workspacePath,
+          customTitle: session.customTitle,
+          creationDate: session.creationDate,
+          lastMessageDate: session.lastMessageDate,
+        });
+        const encrypted = Encryption.encryptToString(payload, this.passphrase!);
+        const contentHash = Encryption.hashContent(session.rawContent);
 
         // If overwriting an existing remote session, back it up
         if (action.action === 'push' && remoteMap.has(sessionId)) {
@@ -531,6 +553,7 @@ export class SyncEngine {
           sessionId,
           workspaceId: session.workspaceId,
           workspacePath: session.workspacePath,
+          fileExtension: session.fileExtension,
           customTitle: session.customTitle,
           lastMessageDate: session.lastMessageDate,
           creationDate: session.creationDate,

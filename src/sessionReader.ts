@@ -3,19 +3,21 @@ import * as path from 'path';
 import * as os from 'os';
 import type {
   CopilotSession,
-  NormalizedRequest,
-  RawCopilotSession,
-  ResponsePart,
+  SessionIndexEntry,
   SessionStoreIndex,
 } from './types';
 
 /**
- * Reads Copilot chat sessions from the local VS Code storage.
+ * Reads and writes Copilot chat sessions from/to VS Code's local storage.
  *
  * Sessions are stored under:
  *   <userDataDir>/User/workspaceStorage/<workspaceId>/
  *     - state.vscdb  (SQLite DB with session index)
- *     - chatSessions/<sessionId>.json
+ *     - chatSessions/<sessionId>.json   (old format — single JSON object)
+ *     - chatSessions/<sessionId>.jsonl  (new format — append-only JSONL log)
+ *
+ * Files are treated as opaque blobs — we never parse or re-serialize session
+ * content. This preserves both the old `.json` and new `.jsonl` formats exactly.
  */
 export class SessionReader {
   private userDataDir: string;
@@ -85,8 +87,7 @@ export class SessionReader {
     const workspaceIds: string[] = [];
 
     for (const entry of entries) {
-      if (!entry.isDirectory()) {continue;}
-      // Check if this workspace has chat sessions
+      if (!entry.isDirectory()) { continue; }
       const chatDir = path.join(storageDir, entry.name, 'chatSessions');
       if (fs.existsSync(chatDir)) {
         workspaceIds.push(entry.name);
@@ -97,16 +98,14 @@ export class SessionReader {
   }
 
   /**
-   * Read the workspace.json to get the actual workspace path.
+   * Read the workspace.json to get the actual workspace folder path.
    */
   async getWorkspacePath(workspaceId: string): Promise<string> {
     const wsJsonPath = path.join(this.workspaceStorageDir, workspaceId, 'workspace.json');
     try {
       const content = await fs.promises.readFile(wsJsonPath, 'utf-8');
       const wsData = JSON.parse(content);
-      // workspace.json has a "folder" or "workspace" field with a URI
       const uri: string = wsData.folder ?? wsData.workspace ?? '';
-      // Convert file:// URI to path
       if (uri.startsWith('file://')) {
         return decodeURIComponent(uri.replace('file://', ''));
       }
@@ -118,7 +117,6 @@ export class SessionReader {
 
   /**
    * Build a map of workspace path → local workspace ID.
-   * Used to find the correct local workspace ID when pulling sessions from another device.
    */
   async buildWorkspacePathMap(): Promise<Map<string, string>> {
     const storageDir = this.workspaceStorageDir;
@@ -130,7 +128,7 @@ export class SessionReader {
 
     const entries = await fs.promises.readdir(storageDir, { withFileTypes: true });
     for (const entry of entries) {
-      if (!entry.isDirectory()) {continue;}
+      if (!entry.isDirectory()) { continue; }
       const wsPath = await this.getWorkspacePath(entry.name);
       if (!wsPath.startsWith('unknown-workspace-')) {
         pathMap.set(wsPath, entry.name);
@@ -142,7 +140,6 @@ export class SessionReader {
 
   /**
    * Find the local workspace ID for a given workspace path.
-   * If no matching workspace exists locally, returns null.
    */
   async findLocalWorkspaceId(workspacePath: string): Promise<string | null> {
     const pathMap = await this.buildWorkspacePathMap();
@@ -152,7 +149,7 @@ export class SessionReader {
       return pathMap.get(workspacePath)!;
     }
 
-    // Try matching by folder name (last path component) for cross-platform compatibility
+    // Try matching by folder name for cross-platform compatibility
     const targetFolderName = path.basename(workspacePath);
     for (const [wsPath, wsId] of pathMap) {
       if (path.basename(wsPath) === targetFolderName) {
@@ -165,12 +162,10 @@ export class SessionReader {
 
   /**
    * Get the workspace ID of the currently open workspace in VS Code.
-   * Falls back to scanning workspace storage if the API doesn't provide it.
    */
   async getCurrentWorkspaceId(): Promise<string | null> {
-    // VS Code doesn't expose workspace storage ID directly,
-    // but we can match by the currently open folder path
-    const workspaceFolders = require('vscode').workspace?.workspaceFolders;
+    const vscode = require('vscode');
+    const workspaceFolders = vscode.workspace?.workspaceFolders;
     if (!workspaceFolders || workspaceFolders.length === 0) {
       return null;
     }
@@ -179,36 +174,38 @@ export class SessionReader {
     return this.findLocalWorkspaceId(currentPath);
   }
 
+  // ─── Session File Discovery ───────────────────────────────────────────────
+
+  /**
+   * Scan the chatSessions directory for both .json and .jsonl files.
+   */
+  private async scanChatSessionFiles(chatDir: string): Promise<{ id: string; ext: string }[]> {
+    if (!fs.existsSync(chatDir)) {
+      return [];
+    }
+
+    const files = await fs.promises.readdir(chatDir);
+    const results: { id: string; ext: string }[] = [];
+
+    for (const f of files) {
+      if (f.endsWith('.jsonl')) {
+        results.push({ id: f.replace('.jsonl', ''), ext: '.jsonl' });
+      } else if (f.endsWith('.json')) {
+        results.push({ id: f.replace('.json', ''), ext: '.json' });
+      }
+    }
+
+    return results;
+  }
+
   // ─── Session Index (SQLite) ───────────────────────────────────────────────
 
   /**
-   * Read the session index from state.vscdb (SQLite database).
-   * Falls back to scanning the chatSessions directory if SQLite read fails.
+   * Read the session index from state.vscdb.
+   * Returns entries as a dict keyed by session ID.
    */
-  async getSessionIndex(workspaceId: string): Promise<string[]> {
-    const chatDir = path.join(this.workspaceStorageDir, workspaceId, 'chatSessions');
-
-    // Try SQLite first
+  private async readSessionIndexFromDb(dbPath: string): Promise<Record<string, SessionIndexEntry>> {
     try {
-      const dbPath = path.join(this.workspaceStorageDir, workspaceId, 'state.vscdb');
-      if (fs.existsSync(dbPath)) {
-        const sessionIds = await this.readSessionIndexFromDb(dbPath);
-        if (sessionIds.length > 0) {
-          return sessionIds;
-        }
-      }
-    } catch (err) {
-      // SQLite read failed, fall back to directory scan
-      console.warn(`[Copilot Session Sync] SQLite read failed for ${workspaceId}, falling back to directory scan:`, err);
-    }
-
-    // Fallback: scan chatSessions directory
-    return this.scanChatSessionsDir(chatDir);
-  }
-
-  private async readSessionIndexFromDb(dbPath: string): Promise<string[]> {
-    try {
-      // Dynamic import of better-sqlite3
       const Database = require('better-sqlite3');
       const db = new Database(dbPath, { readonly: true, fileMustExist: true });
 
@@ -218,50 +215,92 @@ export class SessionReader {
         ).get() as { value: string } | undefined;
 
         if (!row?.value) {
-          return [];
+          return {};
         }
 
-        const index: SessionStoreIndex = JSON.parse(row.value);
-        return (index.entries ?? []).map((e) => e.sessionId).filter(Boolean);
+        const index = JSON.parse(row.value);
+
+        // Handle both old format (array) and new format (dict)
+        if (Array.isArray(index.entries)) {
+          const result: Record<string, SessionIndexEntry> = {};
+          for (const e of index.entries) {
+            if (e.sessionId) {
+              result[e.sessionId] = {
+                sessionId: e.sessionId,
+                title: e.title ?? 'Untitled',
+                lastMessageDate: 0,
+                timing: { created: 0, lastRequestStarted: 0, lastRequestEnded: 0 },
+                initialLocation: 'panel',
+                hasPendingEdits: false,
+                isEmpty: false,
+                isExternal: false,
+                lastResponseState: 0,
+              };
+            }
+          }
+          return result;
+        }
+
+        // New format: entries is a Record<string, SessionIndexEntry>
+        return index.entries ?? {};
       } finally {
         db.close();
       }
     } catch (err) {
       console.warn('[Copilot Session Sync] Could not read state.vscdb:', err);
-      return [];
+      return {};
     }
-  }
-
-  private async scanChatSessionsDir(chatDir: string): Promise<string[]> {
-    if (!fs.existsSync(chatDir)) {
-      return [];
-    }
-
-    const files = await fs.promises.readdir(chatDir);
-    return files
-      .filter((f) => f.endsWith('.json'))
-      .map((f) => f.replace('.json', ''));
   }
 
   // ─── Session Reading ──────────────────────────────────────────────────────
 
   /**
-   * Read a single session file and normalize it.
+   * Read a single session file as raw content (opaque blob).
    */
-  async readSession(workspaceId: string, sessionId: string): Promise<CopilotSession | null> {
+  async readSession(
+    workspaceId: string,
+    sessionId: string,
+    fileExt: string,
+    indexEntry?: SessionIndexEntry
+  ): Promise<CopilotSession | null> {
     const sessionPath = path.join(
       this.workspaceStorageDir,
       workspaceId,
       'chatSessions',
-      `${sessionId}.json`
+      `${sessionId}${fileExt}`
     );
 
     try {
-      const content = await fs.promises.readFile(sessionPath, 'utf-8');
-      const raw: RawCopilotSession = JSON.parse(content);
+      const rawContent = await fs.promises.readFile(sessionPath, 'utf-8');
       const workspacePath = await this.getWorkspacePath(workspaceId);
 
-      return this.normalizeSession(sessionId, workspaceId, workspacePath, raw);
+      // Extract metadata from the index if available
+      let title = 'Untitled';
+      let creationDate = 0;
+      let lastMessageDate = 0;
+
+      if (indexEntry) {
+        title = indexEntry.title || 'Untitled';
+        lastMessageDate = indexEntry.lastMessageDate || 0;
+        creationDate = indexEntry.timing?.created || 0;
+      } else {
+        // Try to extract minimal metadata from the file content
+        const meta = this.extractMetadataFromFile(rawContent, fileExt);
+        title = meta.title;
+        creationDate = meta.creationDate;
+        lastMessageDate = meta.lastMessageDate;
+      }
+
+      return {
+        id: sessionId,
+        workspaceId,
+        workspacePath,
+        fileExtension: fileExt,
+        rawContent,
+        customTitle: title,
+        creationDate,
+        lastMessageDate,
+      };
     } catch (err) {
       console.warn(`[Copilot Session Sync] Failed to read session ${sessionId}:`, err);
       return null;
@@ -269,7 +308,43 @@ export class SessionReader {
   }
 
   /**
-   * Read all sessions from all workspaces.
+   * Extract minimal metadata from a session file without full parsing.
+   */
+  private extractMetadataFromFile(
+    content: string,
+    ext: string
+  ): { title: string; creationDate: number; lastMessageDate: number } {
+    try {
+      if (ext === '.jsonl') {
+        // JSONL: first line is kind:0 with initial state in "v"
+        const firstNewline = content.indexOf('\n');
+        const firstLine = firstNewline > 0 ? content.substring(0, firstNewline) : content;
+        const obj = JSON.parse(firstLine);
+        if (obj.kind === 0 && obj.v) {
+          return {
+            title: obj.v.customTitle ?? 'Untitled',
+            creationDate: obj.v.creationDate ?? 0,
+            lastMessageDate: obj.v.lastMessageDate ?? obj.v.creationDate ?? 0,
+          };
+        }
+      } else {
+        // JSON: parse the full object
+        const obj = JSON.parse(content);
+        return {
+          title: obj.customTitle ?? 'Untitled',
+          creationDate: obj.creationDate ?? 0,
+          lastMessageDate: obj.lastMessageDate ?? 0,
+        };
+      }
+    } catch {
+      // Ignore parse errors
+    }
+
+    return { title: 'Untitled', creationDate: 0, lastMessageDate: 0 };
+  }
+
+  /**
+   * Read all sessions from all workspaces as raw blobs.
    */
   async readAllSessions(excludedWorkspaces: string[] = []): Promise<CopilotSession[]> {
     const workspaceIds = await this.listWorkspaceIds();
@@ -278,14 +353,28 @@ export class SessionReader {
     for (const wsId of workspaceIds) {
       const wsPath = await this.getWorkspacePath(wsId);
 
-      // Check if this workspace is excluded
+      // Check if excluded
       if (excludedWorkspaces.some((excluded) => wsPath.startsWith(excluded))) {
         continue;
       }
 
-      const sessionIds = await this.getSessionIndex(wsId);
-      for (const sessionId of sessionIds) {
-        const session = await this.readSession(wsId, sessionId);
+      // Try to read the index from state.vscdb for metadata
+      const dbPath = path.join(this.workspaceStorageDir, wsId, 'state.vscdb');
+      let indexEntries: Record<string, SessionIndexEntry> = {};
+      try {
+        if (fs.existsSync(dbPath)) {
+          indexEntries = await this.readSessionIndexFromDb(dbPath);
+        }
+      } catch {
+        // Fall back to file-level metadata extraction
+      }
+
+      // Scan the chatSessions directory for actual files
+      const chatDir = path.join(this.workspaceStorageDir, wsId, 'chatSessions');
+      const files = await this.scanChatSessionFiles(chatDir);
+
+      for (const { id, ext } of files) {
+        const session = await this.readSession(wsId, id, ext, indexEntries[id]);
         if (session) {
           sessions.push(session);
         }
@@ -304,14 +393,19 @@ export class SessionReader {
   ): Promise<CopilotSession[]> {
     const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
     const all = await this.readAllSessions(excludedWorkspaces);
-    return all.filter((s) => s.lastMessageDate >= cutoff);
+    return all.filter((s) => {
+      // If we have no date info, include the session
+      if (s.lastMessageDate === 0 && s.creationDate === 0) {
+        return true;
+      }
+      return (s.lastMessageDate || s.creationDate) >= cutoff;
+    });
   }
 
   // ─── Write Session (for importing from remote) ────────────────────────────
 
   /**
-   * Write a session to the local chat sessions directory.
-   * Used when pulling new sessions from the remote.
+   * Write a session's raw content to the local chatSessions directory.
    */
   async writeSession(session: CopilotSession): Promise<void> {
     const chatDir = path.join(
@@ -323,26 +417,15 @@ export class SessionReader {
     // Ensure the directory exists
     await fs.promises.mkdir(chatDir, { recursive: true });
 
-    // Convert back to raw format
-    const raw: RawCopilotSession = {
-      customTitle: session.customTitle,
-      creationDate: session.creationDate,
-      lastMessageDate: session.lastMessageDate,
-      requests: session.requests.map((r) => ({
-        message: { text: r.message },
-        timestamp: r.timestamp,
-        response: r.response,
-      })),
-    };
-
-    const sessionPath = path.join(chatDir, `${session.id}.json`);
-    await fs.promises.writeFile(sessionPath, JSON.stringify(raw, null, 2), 'utf-8');
+    const sessionPath = path.join(chatDir, `${session.id}${session.fileExtension}`);
+    await fs.promises.writeFile(sessionPath, session.rawContent, 'utf-8');
   }
 
   /**
    * Update the session index in state.vscdb to include a new session.
+   * Uses the real VS Code format: {version: 1, entries: {id: {...}}}
    */
-  async addToSessionIndex(workspaceId: string, sessionId: string): Promise<void> {
+  async addToSessionIndex(workspaceId: string, session: CopilotSession): Promise<void> {
     const dbPath = path.join(this.workspaceStorageDir, workspaceId, 'state.vscdb');
 
     try {
@@ -354,74 +437,44 @@ export class SessionReader {
           "SELECT value FROM ItemTable WHERE key = 'chat.ChatSessionStore.index'"
         ).get() as { value: string } | undefined;
 
-        let index: SessionStoreIndex = { entries: [] };
+        let index: SessionStoreIndex = { version: 1, entries: {} };
         if (row?.value) {
-          index = JSON.parse(row.value);
+          const parsed = JSON.parse(row.value);
+          if (Array.isArray(parsed.entries)) {
+            // Migrate old array format to new dict format
+            index = { version: 1, entries: {} };
+          } else {
+            index = parsed;
+          }
         }
 
-        // Check if session already in index
-        if (!index.entries.some((e) => e.sessionId === sessionId)) {
-          index.entries.push({ sessionId, isActive: false });
+        const now = Date.now();
 
-          db.prepare(
-            "INSERT OR REPLACE INTO ItemTable (key, value) VALUES ('chat.ChatSessionStore.index', ?)"
-          ).run(JSON.stringify(index));
-        }
+        // Add or update the entry using the real VS Code format
+        index.entries[session.id] = {
+          sessionId: session.id,
+          title: session.customTitle || 'Synced Session',
+          lastMessageDate: session.lastMessageDate || now,
+          timing: {
+            created: session.creationDate || now,
+            lastRequestStarted: session.lastMessageDate || now,
+            lastRequestEnded: session.lastMessageDate || now,
+          },
+          initialLocation: 'panel',
+          hasPendingEdits: false,
+          isEmpty: false,
+          isExternal: false,
+          lastResponseState: 2,
+        };
+
+        db.prepare(
+          "INSERT OR REPLACE INTO ItemTable (key, value) VALUES ('chat.ChatSessionStore.index', ?)"
+        ).run(JSON.stringify(index));
       } finally {
         db.close();
       }
     } catch (err) {
       console.warn(`[Copilot Session Sync] Failed to update session index for ${workspaceId}:`, err);
     }
-  }
-
-  // ─── Normalization ────────────────────────────────────────────────────────
-
-  private normalizeSession(
-    id: string,
-    workspaceId: string,
-    workspacePath: string,
-    raw: RawCopilotSession
-  ): CopilotSession {
-    return {
-      id,
-      workspaceId,
-      workspacePath,
-      customTitle: raw.customTitle ?? 'Untitled Session',
-      creationDate: raw.creationDate ?? 0,
-      lastMessageDate: raw.lastMessageDate ?? 0,
-      requests: (raw.requests ?? []).map((r) => this.normalizeRequest(r)),
-    };
-  }
-
-  private normalizeRequest(raw: {
-    message: { text: string };
-    timestamp: number;
-    response: ResponsePart[] | string;
-  }): NormalizedRequest {
-    let response: ResponsePart[];
-
-    if (typeof raw.response === 'string') {
-      // Legacy format: flat string
-      response = [{ kind: 'markdownContent', value: raw.response }];
-    } else if (Array.isArray(raw.response)) {
-      response = raw.response.map((part) => {
-        if (typeof part === 'string') {
-          return { kind: 'markdownContent', value: part };
-        }
-        return {
-          kind: part.kind ?? 'markdownContent',
-          value: typeof part.value === 'string' ? part.value : JSON.stringify(part.value),
-        };
-      });
-    } else {
-      response = [{ kind: 'markdownContent', value: String(raw.response ?? '') }];
-    }
-
-    return {
-      message: raw.message?.text ?? '',
-      timestamp: raw.timestamp ?? 0,
-      response,
-    };
   }
 }

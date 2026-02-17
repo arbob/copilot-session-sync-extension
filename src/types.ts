@@ -1,42 +1,21 @@
 // ─── Copilot Chat Session Types ──────────────────────────────────────────────
 
-/** A single message part in a Copilot response */
-export interface ResponsePart {
-  kind: 'markdownContent' | 'thinking' | 'codeBlock' | 'inlineReference' | string;
-  value: string;
-}
-
-/** A single request/response pair within a session */
-export interface SessionRequest {
-  message: { text: string };
-  timestamp: number;
-  response: ResponsePart[] | string; // old format uses string, new uses array
-}
-
-/** A full Copilot chat session as stored on disk */
-export interface RawCopilotSession {
-  customTitle?: string;
-  creationDate: number;
-  lastMessageDate: number;
-  requests: SessionRequest[];
-}
-
-/** Normalized session used internally by the extension */
+/**
+ * A Copilot chat session carrying its raw file content.
+ * Session files are treated as opaque blobs — we never parse/re-serialize them.
+ * This preserves both the old `.json` format and the new `.jsonl` (append-only log) format.
+ */
 export interface CopilotSession {
   id: string;
   workspaceId: string;
   workspacePath: string;
+  /** File extension including the dot, e.g. '.json' or '.jsonl' */
+  fileExtension: string;
+  /** The raw file content read from disk — written back as-is on the target device */
+  rawContent: string;
   customTitle: string;
   creationDate: number;
   lastMessageDate: number;
-  requests: NormalizedRequest[];
-}
-
-/** Normalized request with response always as an array */
-export interface NormalizedRequest {
-  message: string;
-  timestamp: number;
-  response: ResponsePart[];
 }
 
 // ─── Sync Manifest Types ────────────────────────────────────────────────────
@@ -46,10 +25,12 @@ export interface SyncManifestEntry {
   sessionId: string;
   workspaceId: string;
   workspacePath: string;
+  /** File extension including the dot, e.g. '.json' or '.jsonl' */
+  fileExtension: string;
   customTitle: string;
   lastMessageDate: number;
   creationDate: number;
-  sha: string; // GitHub blob SHA for the encrypted file
+  sha: string; // content hash of the raw session file
   deviceId: string; // which device last pushed this
   updatedAt: number; // timestamp of last sync
 }
@@ -64,16 +45,27 @@ export interface SyncManifest {
 
 // ─── Session Index (from state.vscdb) ────────────────────────────────────────
 
-/** An entry in the VS Code chat session store index */
+/** An entry in the VS Code chat session store index (matches real format) */
 export interface SessionIndexEntry {
-  odpiId?: string;
   sessionId: string;
-  isActive?: boolean;
+  title: string;
+  lastMessageDate: number;
+  timing: {
+    created: number;
+    lastRequestStarted: number;
+    lastRequestEnded: number;
+  };
+  initialLocation: string;
+  hasPendingEdits: boolean;
+  isEmpty: boolean;
+  isExternal: boolean;
+  lastResponseState: number;
 }
 
-/** The session store index value from state.vscdb */
+/** The session store index value from state.vscdb (matches real format) */
 export interface SessionStoreIndex {
-  entries: SessionIndexEntry[];
+  version: number;
+  entries: Record<string, SessionIndexEntry>;
 }
 
 // ─── GitHub API Types ────────────────────────────────────────────────────────

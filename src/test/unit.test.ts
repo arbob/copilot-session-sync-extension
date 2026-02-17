@@ -97,10 +97,11 @@ describe('ConflictResolver', () => {
       id: 'session-1',
       workspaceId: 'ws-1',
       workspacePath: '/home/user/project',
+      fileExtension: '.jsonl',
+      rawContent: '{"kind":0,"v":{}}',
       customTitle: 'Test Session',
       creationDate: 1000,
       lastMessageDate: 2000,
-      requests: [],
       ...overrides,
     };
   }
@@ -112,6 +113,7 @@ describe('ConflictResolver', () => {
       sessionId: 'session-1',
       workspaceId: 'ws-1',
       workspacePath: '/home/user/project',
+      fileExtension: '.jsonl',
       customTitle: 'Test Session',
       lastMessageDate: 2000,
       creationDate: 1000,
