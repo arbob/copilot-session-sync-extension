@@ -2,7 +2,7 @@
   "name": "copilot-session-sync",
   "displayName": "Copilot Session Sync",
   "description": "Sync GitHub Copilot chat sessions across devices using a private GitHub repository with AES-256 encryption.",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "publisher": "arbob",
   "license": "MIT",
   "engines": {
@@ -39,10 +39,6 @@
         "title": "Copilot Session Sync: Set Encryption Passphrase"
       },
       {
-        "command": "copilot-session-sync.toggleWorkspace",
-        "title": "Copilot Session Sync: Toggle Sync for This Workspace"
-      },
-      {
         "command": "copilot-session-sync.viewSyncStatus",
         "title": "Copilot Session Sync: View Sync Status"
       },
@@ -64,14 +60,6 @@
           "default": 5,
           "minimum": 1,
           "description": "How often to sync sessions (in minutes)."
-        },
-        "copilotSessionSync.excludedWorkspaces": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "default": [],
-          "description": "List of workspace folder paths to exclude from sync."
         },
         "copilotSessionSync.maxSessionAgeDays": {
           "type": "number",

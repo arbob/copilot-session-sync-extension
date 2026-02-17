@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as crypto from 'crypto';
+import * as path from 'path';
 import { SessionReader, type SessionMetadata } from './sessionReader';
 import { Encryption, CachedEncryptor } from './encryption';
 import { GitHubRepo } from './githubRepo';
@@ -375,6 +376,13 @@ export class SyncEngine {
   private async pullFromRemote(): Promise<void> {
     this.log('Pulling from remote...');
 
+    // Determine the current workspace storage ID — all pulled sessions go here
+    const currentWsId = this.getCurrentWorkspaceStorageId();
+    if (!currentWsId) {
+      this.log('No workspace open — cannot pull sessions.');
+      return;
+    }
+
     const manifest = await this.getRemoteManifest();
     if (!manifest) {
       this.log('No remote manifest found — nothing to pull.');
@@ -383,10 +391,9 @@ export class SyncEngine {
 
     const config = vscode.workspace.getConfiguration('copilotSessionSync');
     const maxAgeDays = config.get<number>('maxSessionAgeDays', 90);
-    const excludedWorkspaces = config.get<string[]>('excludedWorkspaces', []);
 
-    // Use metadata-only reads for the local side (fast — no file content loaded)
-    const localMetadata = await this.sessionReader.readRecentSessionMetadata(maxAgeDays, excludedWorkspaces);
+    // Read metadata from ALL workspaces (no exclusions)
+    const localMetadata = await this.sessionReader.readRecentSessionMetadata(maxAgeDays);
 
     // Build maps
     const localMetaMap = new Map<string, SessionMetadata>();
@@ -432,7 +439,7 @@ export class SyncEngine {
     for (const [sessionId, action] of actions) {
       if (action.action === 'pull' || action.action === 'new-remote') {
         try {
-          await this.pullSession(sessionId, manifest.entries[sessionId]);
+          await this.pullSession(sessionId, manifest.entries[sessionId], currentWsId);
           pullCount++;
           this.log('Pulled session: ' + action.reason);
         } catch (err) {
@@ -445,9 +452,24 @@ export class SyncEngine {
   }
 
   /**
-   * Pull a single session from the remote.
+   * Get the current workspace storage ID from the extension's storageUri.
+   * storageUri path: .../workspaceStorage/<wsId>/<extensionId>/
    */
-  private async pullSession(sessionId: string, entry: SyncManifestEntry): Promise<void> {
+  private getCurrentWorkspaceStorageId(): string | null {
+    const storageUri = this.context.storageUri;
+    if (!storageUri) {
+      return null;
+    }
+    // storageUri.fsPath = .../workspaceStorage/<wsId>/<extensionId>
+    const parentDir = path.dirname(storageUri.fsPath);
+    return path.basename(parentDir);
+  }
+
+  /**
+   * Pull a single session from the remote into the current workspace.
+   * All sessions are written to the current workspace — no per-workspace mapping.
+   */
+  private async pullSession(sessionId: string, entry: SyncManifestEntry, currentWsId: string): Promise<void> {
     const encryptedContent = await this.githubRepo.getFileContent('sessions/' + sessionId + '.enc');
     if (!encryptedContent) {
       this.log('Session file not found in repo: sessions/' + sessionId + '.enc');
@@ -464,7 +486,7 @@ export class SyncEngine {
 
     const session: CopilotSession = {
       id: sessionId,
-      workspaceId: '',
+      workspaceId: currentWsId,
       workspacePath: payload.workspacePath ?? entry.workspacePath,
       fileExtension: payload.fileExtension ?? entry.fileExtension ?? '.jsonl',
       rawContent: payload.rawContent,
@@ -473,24 +495,10 @@ export class SyncEngine {
       lastMessageDate: payload.lastMessageDate ?? entry.lastMessageDate ?? 0,
     };
 
-    const localWorkspaceId = await this.sessionReader.findLocalWorkspaceId(session.workspacePath);
-
-    if (localWorkspaceId) {
-      this.log('Mapped remote workspace "' + session.workspacePath + '" to local ID: ' + localWorkspaceId);
-      session.workspaceId = localWorkspaceId;
-    } else {
-      const currentWsId = await this.sessionReader.getCurrentWorkspaceId();
-      if (currentWsId) {
-        this.log('No local workspace match for "' + session.workspacePath + '" — writing to current workspace: ' + currentWsId);
-        session.workspaceId = currentWsId;
-      } else {
-        this.log('No matching workspace found for "' + session.workspacePath + '" — skipping session "' + session.customTitle + '".');
-        return;
-      }
-    }
+    this.log('Writing session "' + session.customTitle + '" to current workspace: ' + currentWsId);
 
     await this.sessionReader.writeSession(session);
-    await this.sessionReader.addToSessionIndex(session.workspaceId, session);
+    await this.sessionReader.addToSessionIndex(currentWsId, session);
   }
 
   /**
@@ -504,12 +512,11 @@ export class SyncEngine {
 
     const config = vscode.workspace.getConfiguration('copilotSessionSync');
     const maxAgeDays = config.get<number>('maxSessionAgeDays', 90);
-    const excludedWorkspaces = config.get<string[]>('excludedWorkspaces', []);
     const maxSizeMB = config.get<number>('maxSessionSizeMB', 50);
     const maxSizeBytes = maxSizeMB * 1024 * 1024;
 
-    // 1. Read only metadata (fast — no file content loaded)
-    const allMetadata = await this.sessionReader.readRecentSessionMetadata(maxAgeDays, excludedWorkspaces);
+    // 1. Read only metadata from ALL workspaces (fast — no file content loaded)
+    const allMetadata = await this.sessionReader.readRecentSessionMetadata(maxAgeDays);
 
     // Filter out oversized sessions
     const metadata = allMetadata.filter((m) => {

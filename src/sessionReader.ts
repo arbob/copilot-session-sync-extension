@@ -126,52 +126,6 @@ export class SessionReader {
     }
   }
 
-  async buildWorkspacePathMap(): Promise<Map<string, string>> {
-    const storageDir = this.workspaceStorageDir;
-    const pathMap = new Map<string, string>();
-
-    if (!fs.existsSync(storageDir)) {
-      return pathMap;
-    }
-
-    const entries = await fs.promises.readdir(storageDir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isDirectory()) { continue; }
-      const wsPath = await this.getWorkspacePath(entry.name);
-      if (!wsPath.startsWith('unknown-workspace-')) {
-        pathMap.set(wsPath, entry.name);
-      }
-    }
-
-    return pathMap;
-  }
-
-  async findLocalWorkspaceId(workspacePath: string): Promise<string | null> {
-    const pathMap = await this.buildWorkspacePathMap();
-
-    if (pathMap.has(workspacePath)) {
-      return pathMap.get(workspacePath)!;
-    }
-
-    const targetFolderName = path.basename(workspacePath);
-    for (const [wsPath, wsId] of pathMap) {
-      if (path.basename(wsPath) === targetFolderName) {
-        return wsId;
-      }
-    }
-
-    return null;
-  }
-
-  async getCurrentWorkspaceId(): Promise<string | null> {
-    const workspaceFolders = require('vscode').workspace?.workspaceFolders;
-    if (!workspaceFolders || workspaceFolders.length === 0) {
-      return null;
-    }
-    const currentPath = workspaceFolders[0].uri.fsPath;
-    return this.findLocalWorkspaceId(currentPath);
-  }
-
   // ─── Session Index (SQLite) ───────────────────────────────────────────────
 
   async getSessionIndex(workspaceId: string): Promise<string[]> {
@@ -336,16 +290,11 @@ export class SessionReader {
   /**
    * Read all sessions from all workspaces as opaque blobs.
    */
-  async readAllSessions(excludedWorkspaces: string[] = []): Promise<CopilotSession[]> {
+  async readAllSessions(): Promise<CopilotSession[]> {
     const workspaceIds = await this.listWorkspaceIds();
     const sessions: CopilotSession[] = [];
 
     for (const wsId of workspaceIds) {
-      const wsPath = await this.getWorkspacePath(wsId);
-      if (excludedWorkspaces.some((excluded) => wsPath.startsWith(excluded))) {
-        continue;
-      }
-
       const sessionIds = await this.getSessionIndex(wsId);
       for (const sessionId of sessionIds) {
         const session = await this.readSession(wsId, sessionId);
@@ -362,16 +311,11 @@ export class SessionReader {
    * Read all session metadata (no raw content) from all workspaces.
    * Much faster than readAllSessions for change-detection.
    */
-  async readAllSessionMetadata(excludedWorkspaces: string[] = []): Promise<SessionMetadata[]> {
+  async readAllSessionMetadata(): Promise<SessionMetadata[]> {
     const workspaceIds = await this.listWorkspaceIds();
     const metadataList: SessionMetadata[] = [];
 
     for (const wsId of workspaceIds) {
-      const wsPath = await this.getWorkspacePath(wsId);
-      if (excludedWorkspaces.some((excluded) => wsPath.startsWith(excluded))) {
-        continue;
-      }
-
       const sessionIds = await this.getSessionIndex(wsId);
       for (const sessionId of sessionIds) {
         const meta = await this.readSessionMetadata(wsId, sessionId);
@@ -385,20 +329,18 @@ export class SessionReader {
   }
 
   async readRecentSessions(
-    maxAgeDays: number,
-    excludedWorkspaces: string[] = []
+    maxAgeDays: number
   ): Promise<CopilotSession[]> {
     const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
-    const all = await this.readAllSessions(excludedWorkspaces);
+    const all = await this.readAllSessions();
     return all.filter((s) => s.lastMessageDate >= cutoff);
   }
 
   async readRecentSessionMetadata(
-    maxAgeDays: number,
-    excludedWorkspaces: string[] = []
+    maxAgeDays: number
   ): Promise<SessionMetadata[]> {
     const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
-    const all = await this.readAllSessionMetadata(excludedWorkspaces);
+    const all = await this.readAllSessionMetadata();
     return all.filter((m) => m.lastMessageDate >= cutoff);
   }
 

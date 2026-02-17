@@ -54,36 +54,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('copilot-session-sync.toggleWorkspace', async () => {
-      const workspaceFolders = vscode.workspace.workspaceFolders;
-      if (!workspaceFolders || workspaceFolders.length === 0) {
-        vscode.window.showWarningMessage('No workspace folder is open.');
-        return;
-      }
-
-      const currentPath = workspaceFolders[0].uri.fsPath;
-      const config = vscode.workspace.getConfiguration('copilotSessionSync');
-      const excluded = config.get<string[]>('excludedWorkspaces', []);
-
-      if (excluded.includes(currentPath)) {
-        // Remove from excluded list
-        const updated = excluded.filter((p) => p !== currentPath);
-        await config.update('excludedWorkspaces', updated, vscode.ConfigurationTarget.Global);
-        vscode.window.showInformationMessage(
-          `Copilot Session Sync: "${currentPath}" will now be synced.`
-        );
-      } else {
-        // Add to excluded list
-        excluded.push(currentPath);
-        await config.update('excludedWorkspaces', excluded, vscode.ConfigurationTarget.Global);
-        vscode.window.showInformationMessage(
-          `Copilot Session Sync: "${currentPath}" is now excluded from sync.`
-        );
-      }
-    })
-  );
-
-  context.subscriptions.push(
     vscode.commands.registerCommand('copilot-session-sync.viewSyncStatus', () => {
       const info = syncEngine.status;
       const lines: string[] = [
