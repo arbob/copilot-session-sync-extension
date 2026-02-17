@@ -2,7 +2,7 @@
   "name": "copilot-session-sync",
   "displayName": "Copilot Session Sync",
   "description": "Sync GitHub Copilot chat sessions across devices using a private GitHub repository with AES-256 encryption.",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "publisher": "arbob",
   "license": "MIT",
   "engines": {
@@ -78,6 +78,12 @@
           "default": 90,
           "minimum": 1,
           "description": "Only sync sessions newer than this many days."
+        },
+        "copilotSessionSync.maxSessionSizeMB": {
+          "type": "number",
+          "default": 50,
+          "minimum": 1,
+          "description": "Skip session files larger than this size (in MB). Very large sessions slow down sync."
         },
         "copilotSessionSync.repoName": {
           "type": "string",

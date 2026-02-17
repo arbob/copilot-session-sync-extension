@@ -19,17 +19,43 @@ export class Encryption {
   private static readonly AUTH_TAG_LENGTH = 16; // 128-bit auth tag
   private static readonly CURRENT_VERSION = 1;
 
+  /** Cached derived key — avoids re-running PBKDF2 for every file */
+  private static cachedKey: { passphrase: string; salt: Buffer; key: Buffer } | null = null;
+
   /**
    * Derive a 256-bit key from the passphrase using PBKDF2.
    */
   private static deriveKey(passphrase: string, salt: Buffer): Buffer {
-    return crypto.pbkdf2Sync(
+    // Return cached key if passphrase & salt match
+    if (
+      Encryption.cachedKey &&
+      Encryption.cachedKey.passphrase === passphrase &&
+      Encryption.cachedKey.salt.equals(salt)
+    ) {
+      return Encryption.cachedKey.key;
+    }
+
+    const key = crypto.pbkdf2Sync(
       passphrase,
       salt,
       Encryption.PBKDF2_ITERATIONS,
       Encryption.KEY_LENGTH,
       Encryption.PBKDF2_DIGEST
     );
+
+    // Cache for reuse
+    Encryption.cachedKey = { passphrase, salt: Buffer.from(salt), key };
+    return key;
+  }
+
+  /**
+   * Derive a key once and return a reusable encryptor.
+   * All encrypt calls on the returned object skip PBKDF2.
+   */
+  static createCachedEncryptor(passphrase: string): CachedEncryptor {
+    const salt = crypto.randomBytes(Encryption.SALT_LENGTH);
+    const key = Encryption.deriveKey(passphrase, salt);
+    return new CachedEncryptor(key, salt);
   }
 
   /**
@@ -149,5 +175,51 @@ export class Encryption {
    */
   static hashContent(content: string): string {
     return crypto.createHash('sha256').update(content).digest('hex');
+  }
+
+  /**
+   * Compute a SHA-256 hash of a file from a readable stream or buffer. 
+   * More memory-efficient for large files.
+   */
+  static hashFile(filePath: string): string {
+    const fs = require('fs');
+    const data = fs.readFileSync(filePath);
+    return crypto.createHash('sha256').update(data).digest('hex');
+  }
+}
+
+/**
+ * A reusable encryptor that derives the PBKDF2 key once and reuses it.
+ * Each encryption uses a unique random IV for security.
+ */
+export class CachedEncryptor {
+  private key: Buffer;
+  private salt: Buffer;
+
+  constructor(key: Buffer, salt: Buffer) {
+    this.key = key;
+    this.salt = salt;
+  }
+
+  encrypt(data: string): EncryptedPayload {
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', this.key, iv, {
+      authTagLength: 16,
+    });
+    const encrypted = Buffer.concat([cipher.update(data, 'utf-8'), cipher.final()]);
+    const authTag = cipher.getAuthTag();
+    const ciphertextWithTag = Buffer.concat([encrypted, authTag]);
+
+    return {
+      salt: this.salt.toString('base64'),
+      iv: iv.toString('base64'),
+      ciphertext: ciphertextWithTag.toString('base64'),
+      version: 1,
+    };
+  }
+
+  encryptToString(data: string): string {
+    const payload = this.encrypt(data);
+    return Buffer.from(JSON.stringify(payload)).toString('base64');
   }
 }

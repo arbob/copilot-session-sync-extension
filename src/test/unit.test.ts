@@ -1,5 +1,5 @@
 import * as assert from 'assert';
-import { Encryption } from '../encryption';
+import { Encryption, CachedEncryptor } from '../encryption';
 import { ConflictResolver } from '../conflictResolver';
 import type { CopilotSession, SyncManifestEntry } from '../types';
 
@@ -86,6 +86,70 @@ describe('Encryption', () => {
     const hash2 = Encryption.hashContent('content B');
 
     assert.notStrictEqual(hash1, hash2);
+  });
+
+  it('should use cached key for same passphrase and salt', () => {
+    // Encrypt twice with same passphrase — the second should reuse the cached key
+    const data = 'test cached key derivation';
+    const enc1 = Encryption.encryptToString(data, passphrase);
+    const enc2 = Encryption.encryptToString(data, passphrase);
+
+    // Both should decrypt correctly
+    assert.strictEqual(Encryption.decryptFromString(enc1, passphrase), data);
+    assert.strictEqual(Encryption.decryptFromString(enc2, passphrase), data);
+  });
+});
+
+// ─── CachedEncryptor Tests ──────────────────────────────────────────────────
+
+describe('CachedEncryptor', () => {
+  const passphrase = 'test-passphrase-12345678';
+
+  it('should encrypt and decrypt round-trip via Encryption.decrypt', () => {
+    const encryptor = Encryption.createCachedEncryptor(passphrase);
+    const plaintext = 'Hello from cached encryptor!';
+    const encrypted = encryptor.encrypt(plaintext);
+
+    assert.ok(encrypted.salt);
+    assert.ok(encrypted.iv);
+    assert.ok(encrypted.ciphertext);
+    assert.strictEqual(encrypted.version, 1);
+
+    // Should be decryptable with the standard Encryption.decrypt
+    const decrypted = Encryption.decrypt(encrypted, passphrase);
+    assert.strictEqual(decrypted, plaintext);
+  });
+
+  it('should produce different IVs for each encryption', () => {
+    const encryptor = Encryption.createCachedEncryptor(passphrase);
+    const enc1 = encryptor.encrypt('data1');
+    const enc2 = encryptor.encrypt('data2');
+
+    // Same salt (key derived once), different IVs
+    assert.strictEqual(enc1.salt, enc2.salt);
+    assert.notStrictEqual(enc1.iv, enc2.iv);
+
+    // Both decrypt correctly
+    assert.strictEqual(Encryption.decrypt(enc1, passphrase), 'data1');
+    assert.strictEqual(Encryption.decrypt(enc2, passphrase), 'data2');
+  });
+
+  it('should work with encryptToString', () => {
+    const encryptor = Encryption.createCachedEncryptor(passphrase);
+    const plaintext = 'Test string encryption via cached encryptor';
+    const encrypted = encryptor.encryptToString(plaintext);
+
+    const decrypted = Encryption.decryptFromString(encrypted, passphrase);
+    assert.strictEqual(decrypted, plaintext);
+  });
+
+  it('should handle large payloads efficiently', () => {
+    const encryptor = Encryption.createCachedEncryptor(passphrase);
+    const largePayload = 'x'.repeat(100_000); // 100 KB
+
+    const encrypted = encryptor.encryptToString(largePayload);
+    const decrypted = Encryption.decryptFromString(encrypted, passphrase);
+    assert.strictEqual(decrypted, largePayload);
   });
 });
 

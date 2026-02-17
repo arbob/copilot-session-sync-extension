@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as crypto from 'crypto';
-import { SessionReader } from './sessionReader';
-import { Encryption } from './encryption';
+import { SessionReader, type SessionMetadata } from './sessionReader';
+import { Encryption, CachedEncryptor } from './encryption';
 import { GitHubRepo } from './githubRepo';
 import { ConflictResolver, type ConflictAction } from './conflictResolver';
 import type {
@@ -12,6 +12,16 @@ import type {
   SyncStatus,
   SyncStatusInfo,
 } from './types';
+
+/** Cached hash entry stored in globalState */
+interface CachedHashEntry {
+  /** SHA-256 hash of the raw file content */
+  hash: string;
+  /** File mtime when hash was computed (epoch ms) */
+  mtimeMs: number;
+  /** File size when hash was computed */
+  sizeBytes: number;
+}
 
 /**
  * Orchestrates the sync process between local Copilot chat sessions
@@ -49,31 +59,57 @@ export class SyncEngine {
 
   // ─── Device ID ────────────────────────────────────────────────────────────
 
-  /**
-   * Get or create a unique device identifier for this VS Code installation.
-   */
   private getDeviceId(): string {
     let deviceId = this.context.globalState.get<string>('deviceId');
     if (!deviceId) {
-      deviceId = `device-${crypto.randomBytes(8).toString('hex')}`;
+      deviceId = 'device-' + crypto.randomBytes(8).toString('hex');
       this.context.globalState.update('deviceId', deviceId);
     }
     return deviceId;
   }
 
-  // ─── Passphrase Management ────────────────────────────────────────────────
+  // ─── Local Hash Cache ─────────────────────────────────────────────────────
+
+  private getHashCache(): Record<string, CachedHashEntry> {
+    return this.context.globalState.get<Record<string, CachedHashEntry>>('sessionHashCache') ?? {};
+  }
+
+  private async saveHashCache(cache: Record<string, CachedHashEntry>): Promise<void> {
+    await this.context.globalState.update('sessionHashCache', cache);
+  }
 
   /**
-   * Set the encryption passphrase.
+   * Get the content hash for a session, using the cache if mtime+size haven't changed.
+   * If the cache is stale, reads the file and computes a fresh hash.
    */
+  private async getContentHash(
+    meta: SessionMetadata,
+    hashCache: Record<string, CachedHashEntry>
+  ): Promise<{ hash: string; needsRead: boolean }> {
+    const cached = hashCache[meta.id];
+    if (cached && cached.mtimeMs === meta.mtimeMs && cached.sizeBytes === meta.sizeBytes) {
+      // File hasn't changed since we last hashed it
+      return { hash: cached.hash, needsRead: false };
+    }
+
+    // File changed or not cached yet — read content and hash it
+    const content = await this.sessionReader.readSessionContent(meta.workspaceId, meta.id);
+    if (!content) {
+      return { hash: '', needsRead: false };
+    }
+
+    const hash = Encryption.hashContent(content);
+    hashCache[meta.id] = { hash, mtimeMs: meta.mtimeMs, sizeBytes: meta.sizeBytes };
+    return { hash, needsRead: true };
+  }
+
+  // ─── Passphrase Management ────────────────────────────────────────────────
+
   async setPassphrase(passphrase: string): Promise<void> {
     this.passphrase = passphrase;
     await this.context.secrets.store('syncPassphrase', passphrase);
   }
 
-  /**
-   * Load the passphrase from secure storage.
-   */
   async loadPassphrase(): Promise<boolean> {
     const stored = await this.context.secrets.get('syncPassphrase');
     if (stored) {
@@ -83,9 +119,6 @@ export class SyncEngine {
     return false;
   }
 
-  /**
-   * Prompt the user to enter or set up a passphrase.
-   */
   async promptForPassphrase(isNewSetup: boolean): Promise<boolean> {
     const passphrase = await vscode.window.showInputBox({
       prompt: isNewSetup
@@ -106,7 +139,6 @@ export class SyncEngine {
     }
 
     if (isNewSetup) {
-      // Confirm passphrase
       const confirm = await vscode.window.showInputBox({
         prompt: 'Confirm your encryption passphrase.',
         password: true,
@@ -125,22 +157,16 @@ export class SyncEngine {
 
   // ─── GitHub Authentication with Dialog ────────────────────────────────────
 
-  /**
-   * Show a dialog prompting the user to connect their GitHub account,
-   * then authenticate. Retries if the user initially declines.
-   */
   private async authenticateWithPrompt(): Promise<boolean> {
-    // Check if already authenticated silently first
     try {
       const silentSession = await this.githubRepo.authenticateSilent();
       if (silentSession) {
         return true;
       }
     } catch {
-      // Not authenticated yet — proceed to prompt
+      // Not authenticated yet
     }
 
-    // Show connect dialog
     const connect = await vscode.window.showInformationMessage(
       'Copilot Session Sync needs to connect to your GitHub account to sync chat sessions across devices.',
       { modal: true, detail: 'This will create a private repository under your GitHub account to store encrypted session data.' },
@@ -157,7 +183,7 @@ export class SyncEngine {
       return true;
     } catch (err) {
       const retry = await vscode.window.showErrorMessage(
-        `GitHub authentication failed: ${err instanceof Error ? err.message : String(err)}`,
+        'GitHub authentication failed: ' + (err instanceof Error ? err.message : String(err)),
         'Try Again',
         'Cancel'
       );
@@ -170,17 +196,13 @@ export class SyncEngine {
 
   // ─── Passphrase Verification with Retry ──────────────────────────────────
 
-  /**
-   * Prompt for passphrase and verify against the remote token.
-   * Retries up to 3 times on mismatch before giving up.
-   */
   private async promptAndVerifyPassphrase(verificationToken: string): Promise<boolean> {
     const maxAttempts = 3;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const success = await this.promptForPassphrase(false);
       if (!success) {
-        return false; // User cancelled
+        return false;
       }
 
       if (Encryption.verifyPassphrase(this.passphrase!, verificationToken)) {
@@ -188,13 +210,12 @@ export class SyncEngine {
         return true;
       }
 
-      // Wrong passphrase
       this.passphrase = null;
       await this.context.secrets.delete('syncPassphrase');
 
       if (attempt < maxAttempts) {
         const retry = await vscode.window.showErrorMessage(
-          `Incorrect passphrase (attempt ${attempt}/${maxAttempts}). It does not match the passphrase used on your other device.`,
+          'Incorrect passphrase (attempt ' + attempt + '/' + maxAttempts + '). It does not match the passphrase used on your other device.',
           'Try Again',
           'Cancel'
         );
@@ -213,39 +234,30 @@ export class SyncEngine {
 
   // ─── Initialization ──────────────────────────────────────────────────────
 
-  /**
-   * Initialize the sync engine: authenticate, ensure repo, load passphrase.
-   */
   async initialize(): Promise<boolean> {
     try {
       this.log('Initializing sync engine...');
 
-      // 1. Authenticate with GitHub
       const authenticated = await this.authenticateWithPrompt();
       if (!authenticated) {
         this.updateStatus('setup-required');
         return false;
       }
-      this.log(`Authenticated as ${this.githubRepo.getOwner()}`);
+      this.log('Authenticated as ' + this.githubRepo.getOwner());
 
-      // 2. Ensure the sync repo exists
       await this.githubRepo.ensureRepo();
-      this.log(`Sync repo ready: ${this.githubRepo.getOwner()}/${this.githubRepo.getRepoName()}`);
+      this.log('Sync repo ready: ' + this.githubRepo.getOwner() + '/' + this.githubRepo.getRepoName());
 
-      // 3. Store repo info for cross-device discovery
       this.context.globalState.update('syncRepoOwner', this.githubRepo.getOwner());
       this.context.globalState.update('syncRepoName', this.githubRepo.getRepoName());
       this.context.globalState.setKeysForSync(['syncRepoOwner', 'syncRepoName']);
 
-      // 4. Load or set up passphrase
       const hasPassphrase = await this.loadPassphrase();
 
       if (!hasPassphrase) {
-        // Check if a verification token exists in the repo (another device set up first)
         const verificationToken = await this.githubRepo.getFileContent('verification.token');
 
         if (verificationToken) {
-          // Another device has already set up — prompt for existing passphrase with retry
           this.log('Existing sync setup found. Prompting for passphrase...');
           const verified = await this.promptAndVerifyPassphrase(verificationToken);
           if (!verified) {
@@ -253,7 +265,6 @@ export class SyncEngine {
             return false;
           }
         } else {
-          // First-time setup — create passphrase
           this.log('First-time setup. Prompting for new passphrase...');
           const success = await this.promptForPassphrase(true);
           if (!success) {
@@ -261,7 +272,6 @@ export class SyncEngine {
             return false;
           }
 
-          // Store the verification token in the repo
           const token = Encryption.createVerificationToken(this.passphrase!);
           await this.githubRepo.putFile(
             'verification.token',
@@ -271,7 +281,6 @@ export class SyncEngine {
           this.log('Verification token stored in repo.');
         }
       } else {
-        // Verify stored passphrase against remote token (if exists)
         const verificationToken = await this.githubRepo.getFileContent('verification.token');
         if (verificationToken && (!this.passphrase || !Encryption.verifyPassphrase(this.passphrase, verificationToken))) {
           vscode.window.showWarningMessage(
@@ -300,7 +309,7 @@ export class SyncEngine {
   // ─── Sync Operations ─────────────────────────────────────────────────────
 
   /**
-   * Perform a full sync: pull from remote, then push local changes.
+   * Perform a full sync with progress reporting.
    */
   async sync(): Promise<void> {
     const config = vscode.workspace.getConfiguration('copilotSessionSync');
@@ -323,16 +332,26 @@ export class SyncEngine {
     this.log('Starting sync...');
 
     try {
-      // Re-authenticate in case token expired
-      await this.githubRepo.authenticate();
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Window,
+          title: 'Copilot Sync',
+          cancellable: false,
+        },
+        async (progress) => {
+          // Re-authenticate in case token expired
+          await this.githubRepo.authenticate();
 
-      // 1. Pull remote changes
-      await this.pullFromRemote();
+          progress.report({ message: 'Pulling remote changes...' });
+          await this.pullFromRemote();
 
-      // 2. Push local changes
-      await this.pushToRemote();
+          progress.report({ message: 'Pushing local changes...' });
+          await this.pushToRemote(progress);
 
-      // Update sync state
+          progress.report({ message: 'Done' });
+        }
+      );
+
       const syncState: LocalSyncState = {
         lastSyncTimestamp: Date.now(),
         deviceId: this.getDeviceId(),
@@ -356,22 +375,23 @@ export class SyncEngine {
   private async pullFromRemote(): Promise<void> {
     this.log('Pulling from remote...');
 
-    // 1. Get the remote manifest
     const manifest = await this.getRemoteManifest();
     if (!manifest) {
       this.log('No remote manifest found — nothing to pull.');
       return;
     }
 
-    // 2. Get local sessions
     const config = vscode.workspace.getConfiguration('copilotSessionSync');
     const maxAgeDays = config.get<number>('maxSessionAgeDays', 90);
     const excludedWorkspaces = config.get<string[]>('excludedWorkspaces', []);
-    const localSessions = await this.sessionReader.readRecentSessions(maxAgeDays, excludedWorkspaces);
 
-    const localMap = new Map<string, CopilotSession>();
-    for (const session of localSessions) {
-      localMap.set(session.id, session);
+    // Use metadata-only reads for the local side (fast — no file content loaded)
+    const localMetadata = await this.sessionReader.readRecentSessionMetadata(maxAgeDays, excludedWorkspaces);
+
+    // Build maps
+    const localMetaMap = new Map<string, SessionMetadata>();
+    for (const meta of localMetadata) {
+      localMetaMap.set(meta.id, meta);
     }
 
     const remoteMap = new Map<string, SyncManifestEntry>();
@@ -379,57 +399,72 @@ export class SyncEngine {
       remoteMap.set(id, entry);
     }
 
-    // 3. Compute local hashes (hash the raw file content, not a normalized form)
+    // Compute local hashes using the cache (avoids re-reading unchanged files)
+    const hashCache = this.getHashCache();
     const localHashes = new Map<string, string>();
-    for (const [id, session] of localMap) {
-      localHashes.set(id, Encryption.hashContent(session.rawContent));
+    const localMap = new Map<string, CopilotSession>();
+
+    for (const [id, meta] of localMetaMap) {
+      const { hash } = await this.getContentHash(meta, hashCache);
+      if (hash) {
+        localHashes.set(id, hash);
+        // Build a lightweight CopilotSession for conflict resolution (no rawContent yet)
+        localMap.set(id, {
+          id: meta.id,
+          workspaceId: meta.workspaceId,
+          workspacePath: meta.workspacePath,
+          fileExtension: meta.fileExtension,
+          rawContent: '', // not needed for conflict resolution
+          customTitle: meta.customTitle,
+          creationDate: meta.creationDate,
+          lastMessageDate: meta.lastMessageDate,
+        });
+      }
     }
 
-    // 4. Resolve conflicts
+    await this.saveHashCache(hashCache);
+
+    // Resolve conflicts
     const actions = ConflictResolver.resolveAll(localMap, remoteMap, localHashes);
 
-    // 5. Execute pull actions
+    // Execute pull actions
     let pullCount = 0;
     for (const [sessionId, action] of actions) {
       if (action.action === 'pull' || action.action === 'new-remote') {
         try {
           await this.pullSession(sessionId, manifest.entries[sessionId]);
           pullCount++;
-          this.log(`Pulled session: ${action.reason}`);
+          this.log('Pulled session: ' + action.reason);
         } catch (err) {
-          this.logError(`Failed to pull session ${sessionId}`, err);
+          this.logError('Failed to pull session ' + sessionId, err);
         }
       }
     }
 
-    this.log(`Pull complete: ${pullCount} sessions pulled.`);
+    this.log('Pull complete: ' + pullCount + ' sessions pulled.');
   }
 
   /**
    * Pull a single session from the remote.
-   * Maps the remote workspace ID to the local workspace ID based on workspace path.
    */
   private async pullSession(sessionId: string, entry: SyncManifestEntry): Promise<void> {
-    const encryptedContent = await this.githubRepo.getFileContent(`sessions/${sessionId}.enc`);
+    const encryptedContent = await this.githubRepo.getFileContent('sessions/' + sessionId + '.enc');
     if (!encryptedContent) {
-      this.log(`Session file not found in repo: sessions/${sessionId}.enc`);
+      this.log('Session file not found in repo: sessions/' + sessionId + '.enc');
       return;
     }
 
-    // Decrypt
     const decrypted = Encryption.decryptFromString(encryptedContent, this.passphrase!);
     const payload = JSON.parse(decrypted);
 
-    // Check if this is the new format (has rawContent) or old format
     if (!payload.rawContent) {
-      this.log(`Skipping session ${sessionId}: old format (pre-v0.2.0). Re-push from original device.`);
+      this.log('Skipping session ' + sessionId + ': old format (pre-v0.2.0). Re-push from original device.');
       return;
     }
 
-    // Build the session object
     const session: CopilotSession = {
       id: sessionId,
-      workspaceId: '', // will be resolved below
+      workspaceId: '',
       workspacePath: payload.workspacePath ?? entry.workspacePath,
       fileExtension: payload.fileExtension ?? entry.fileExtension ?? '.jsonl',
       rawContent: payload.rawContent,
@@ -438,51 +473,59 @@ export class SyncEngine {
       lastMessageDate: payload.lastMessageDate ?? entry.lastMessageDate ?? 0,
     };
 
-    // Map the remote workspace path to the local workspace ID
     const localWorkspaceId = await this.sessionReader.findLocalWorkspaceId(session.workspacePath);
 
     if (localWorkspaceId) {
-      this.log(`Mapped remote workspace "${session.workspacePath}" to local ID: ${localWorkspaceId}`);
+      this.log('Mapped remote workspace "' + session.workspacePath + '" to local ID: ' + localWorkspaceId);
       session.workspaceId = localWorkspaceId;
     } else {
-      // Fall back to currently open workspace
       const currentWsId = await this.sessionReader.getCurrentWorkspaceId();
       if (currentWsId) {
-        this.log(`No local workspace match for "${session.workspacePath}" — writing to current workspace: ${currentWsId}`);
+        this.log('No local workspace match for "' + session.workspacePath + '" — writing to current workspace: ' + currentWsId);
         session.workspaceId = currentWsId;
       } else {
-        this.log(`No matching workspace found for "${session.workspacePath}" — skipping session "${session.customTitle}".`);
+        this.log('No matching workspace found for "' + session.workspacePath + '" — skipping session "' + session.customTitle + '".');
         return;
       }
     }
 
-    // Write raw content to local storage
     await this.sessionReader.writeSession(session);
-
-    // Update session index in state.vscdb
     await this.sessionReader.addToSessionIndex(session.workspaceId, session);
   }
 
   /**
    * Push local sessions that are newer than the remote versions.
+   * Uses cached hashes, lazy content loading, and batch encryption.
    */
-  private async pushToRemote(): Promise<void> {
+  private async pushToRemote(
+    progress?: vscode.Progress<{ message?: string; increment?: number }>
+  ): Promise<void> {
     this.log('Pushing to remote...');
 
-    // 1. Get configuration
     const config = vscode.workspace.getConfiguration('copilotSessionSync');
     const maxAgeDays = config.get<number>('maxSessionAgeDays', 90);
     const excludedWorkspaces = config.get<string[]>('excludedWorkspaces', []);
+    const maxSizeMB = config.get<number>('maxSessionSizeMB', 50);
+    const maxSizeBytes = maxSizeMB * 1024 * 1024;
 
-    // 2. Get local sessions
-    const localSessions = await this.sessionReader.readRecentSessions(maxAgeDays, excludedWorkspaces);
+    // 1. Read only metadata (fast — no file content loaded)
+    const allMetadata = await this.sessionReader.readRecentSessionMetadata(maxAgeDays, excludedWorkspaces);
 
-    if (localSessions.length === 0) {
+    // Filter out oversized sessions
+    const metadata = allMetadata.filter((m) => {
+      if (m.sizeBytes > maxSizeBytes) {
+        this.log('Skipping oversized session ' + m.id + ' (' + (m.sizeBytes / 1024 / 1024).toFixed(1) + ' MB > ' + maxSizeMB + ' MB limit)');
+        return false;
+      }
+      return true;
+    });
+
+    if (metadata.length === 0) {
       this.log('No local sessions to push.');
       return;
     }
 
-    // 3. Get current remote manifest
+    // 2. Get remote manifest
     let manifest = await this.getRemoteManifest();
     const isNewManifest = !manifest;
     if (!manifest) {
@@ -494,118 +537,171 @@ export class SyncEngine {
       };
     }
 
-    const localMap = new Map<string, CopilotSession>();
-    for (const session of localSessions) {
-      localMap.set(session.id, session);
-    }
-
     const remoteMap = new Map<string, SyncManifestEntry>();
     for (const [id, entry] of Object.entries(manifest.entries)) {
       remoteMap.set(id, entry);
     }
 
-    // 4. Compute local hashes (hash the raw file content)
+    // 3. Use cached hashes to find which sessions actually changed
+    const hashCache = this.getHashCache();
+    const changedSessions: { meta: SessionMetadata; hash: string }[] = [];
     const localHashes = new Map<string, string>();
-    for (const [id, session] of localMap) {
-      localHashes.set(id, Encryption.hashContent(session.rawContent));
+    const localMap = new Map<string, CopilotSession>();
+
+    this.log('Checking ' + metadata.length + ' sessions for changes...');
+
+    for (const meta of metadata) {
+      const { hash } = await this.getContentHash(meta, hashCache);
+      if (!hash) { continue; }
+
+      localHashes.set(meta.id, hash);
+      localMap.set(meta.id, {
+        id: meta.id,
+        workspaceId: meta.workspaceId,
+        workspacePath: meta.workspacePath,
+        fileExtension: meta.fileExtension,
+        rawContent: '', // placeholder — loaded lazily below only for sessions that need pushing
+        customTitle: meta.customTitle,
+        creationDate: meta.creationDate,
+        lastMessageDate: meta.lastMessageDate,
+      });
     }
 
-    // 5. Resolve conflicts
+    await this.saveHashCache(hashCache);
+
+    // 4. Resolve conflicts
     const actions = ConflictResolver.resolveAll(localMap, remoteMap, localHashes);
 
-    // 6. Collect files to push
-    const filesToPush: { path: string; content: string }[] = [];
-    const backupFiles: { path: string; content: string }[] = [];
-
+    // 5. Identify sessions that need pushing
+    const toPush: { sessionId: string; meta: SessionMetadata; hash: string; action: ConflictAction }[] = [];
     for (const [sessionId, action] of actions) {
       if (action.action === 'push' || action.action === 'new-local') {
-        const session = localMap.get(sessionId)!;
-        // Store raw content + metadata in the encrypted payload
-        const payload = JSON.stringify({
-          rawContent: session.rawContent,
-          fileExtension: session.fileExtension,
-          workspacePath: session.workspacePath,
-          customTitle: session.customTitle,
-          creationDate: session.creationDate,
-          lastMessageDate: session.lastMessageDate,
-        });
-        const encrypted = Encryption.encryptToString(payload, this.passphrase!);
-        const contentHash = Encryption.hashContent(session.rawContent);
+        const meta = metadata.find((m) => m.id === sessionId);
+        const hash = localHashes.get(sessionId);
+        if (meta && hash) {
+          toPush.push({ sessionId, meta, hash, action });
+        }
+      }
+    }
 
-        // If overwriting an existing remote session, back it up
-        if (action.action === 'push' && remoteMap.has(sessionId)) {
-          const existingContent = await this.githubRepo.getFileContent(`sessions/${sessionId}.enc`);
+    if (toPush.length === 0) {
+      this.log('No changes to push.');
+      return;
+    }
+
+    this.log(toPush.length + ' session(s) need pushing. Loading content and encrypting...');
+
+    // 6. Create a cached encryptor (derives PBKDF2 key ONCE)
+    const encryptor = Encryption.createCachedEncryptor(this.passphrase!);
+
+    // 7. Load content lazily and encrypt only changed sessions
+    const filesToPush: { path: string; content: string }[] = [];
+    const backupFiles: { path: string; content: string }[] = [];
+    let encryptedCount = 0;
+
+    for (const { sessionId, meta, hash, action } of toPush) {
+      // Report progress
+      encryptedCount++;
+      if (progress) {
+        progress.report({
+          message: 'Encrypting ' + encryptedCount + '/' + toPush.length + '...',
+        });
+      }
+
+      // Lazy-load raw content
+      const rawContent = await this.sessionReader.readSessionContent(meta.workspaceId, sessionId);
+      if (!rawContent) {
+        this.logError('Could not read content for session ' + sessionId, 'file not found');
+        continue;
+      }
+
+      // Build and encrypt payload
+      const payload = JSON.stringify({
+        rawContent,
+        fileExtension: meta.fileExtension,
+        workspacePath: meta.workspacePath,
+        customTitle: meta.customTitle,
+        creationDate: meta.creationDate,
+        lastMessageDate: meta.lastMessageDate,
+      });
+      const encrypted = encryptor.encryptToString(payload);
+
+      // Back up existing remote session if overwriting
+      if (action.action === 'push' && remoteMap.has(sessionId)) {
+        try {
+          const existingContent = await this.githubRepo.getFileContent('sessions/' + sessionId + '.enc');
           if (existingContent) {
             backupFiles.push({
               path: ConflictResolver.backupPath(sessionId),
               content: existingContent,
             });
           }
+        } catch {
+          // Best effort backup
         }
-
-        filesToPush.push({
-          path: `sessions/${sessionId}.enc`,
-          content: encrypted,
-        });
-
-        // Update manifest entry
-        manifest.entries[sessionId] = {
-          sessionId,
-          workspaceId: session.workspaceId,
-          workspacePath: session.workspacePath,
-          fileExtension: session.fileExtension,
-          customTitle: session.customTitle,
-          lastMessageDate: session.lastMessageDate,
-          creationDate: session.creationDate,
-          sha: contentHash,
-          deviceId: this.getDeviceId(),
-          updatedAt: Date.now(),
-        };
       }
+
+      filesToPush.push({
+        path: 'sessions/' + sessionId + '.enc',
+        content: encrypted,
+      });
+
+      // Update manifest entry
+      manifest.entries[sessionId] = {
+        sessionId,
+        workspaceId: meta.workspaceId,
+        workspacePath: meta.workspacePath,
+        fileExtension: meta.fileExtension,
+        customTitle: meta.customTitle,
+        lastMessageDate: meta.lastMessageDate,
+        creationDate: meta.creationDate,
+        sha: hash,
+        deviceId: this.getDeviceId(),
+        updatedAt: Date.now(),
+      };
     }
 
-    if (filesToPush.length === 0 && backupFiles.length === 0) {
-      this.log('No changes to push.');
+    if (filesToPush.length === 0) {
+      this.log('No files to push after content loading.');
       return;
     }
 
-    // 7. Update manifest
+    // 8. Update and encrypt manifest (uses the cached encryptor too)
     manifest.lastSyncTimestamp = Date.now();
     manifest.deviceId = this.getDeviceId();
 
-    const manifestEncrypted = Encryption.encryptToString(
-      JSON.stringify(manifest),
-      this.passphrase!
-    );
+    const manifestEncrypted = encryptor.encryptToString(JSON.stringify(manifest));
 
     filesToPush.push({
       path: 'manifest.json',
       content: manifestEncrypted,
     });
 
-    // Add backup files
     filesToPush.push(...backupFiles);
 
-    // 8. Batch commit
-    const pushCount = filesToPush.length - 1 - backupFiles.length; // exclude manifest and backups
+    // 9. Batch commit to GitHub
+    const pushCount = filesToPush.length - 1 - backupFiles.length;
+    if (progress) {
+      progress.report({ message: 'Uploading ' + pushCount + ' session(s)...' });
+    }
+
     try {
       await this.githubRepo.batchCommit(
         filesToPush,
         [],
-        `sync: Push ${pushCount} session(s) from ${this.getDeviceId()}`
+        'sync: Push ' + pushCount + ' session(s) from ' + this.getDeviceId()
       );
-      this.log(`Push complete: ${pushCount} sessions pushed.`);
+      this.log('Push complete: ' + pushCount + ' sessions pushed.');
     } catch (err) {
-      // If batch commit fails (e.g., repo is empty), fall back to individual puts
       this.log('Batch commit failed, falling back to individual file operations...');
       for (const file of filesToPush) {
         await this.githubRepo.putFile(
           file.path,
           file.content,
-          `sync: Update ${file.path}`
+          'sync: Update ' + file.path
         );
       }
-      this.log(`Push complete (individual): ${pushCount} sessions pushed.`);
+      this.log('Push complete (individual): ' + pushCount + ' sessions pushed.');
     }
 
     this._status.sessionCount = Object.keys(manifest.entries).length;
@@ -634,9 +730,6 @@ export class SyncEngine {
 
   // ─── Periodic Sync ───────────────────────────────────────────────────────
 
-  /**
-   * Start periodic sync at the configured interval.
-   */
   startPeriodicSync(): void {
     this.stopPeriodicSync();
 
@@ -644,7 +737,7 @@ export class SyncEngine {
     const intervalMinutes = config.get<number>('syncIntervalMinutes', 5);
     const intervalMs = intervalMinutes * 60 * 1000;
 
-    this.log(`Starting periodic sync every ${intervalMinutes} minutes.`);
+    this.log('Starting periodic sync every ' + intervalMinutes + ' minutes.');
 
     this.syncTimer = setInterval(async () => {
       try {
@@ -654,15 +747,11 @@ export class SyncEngine {
       }
     }, intervalMs);
 
-    // Register for cleanup
     this.context.subscriptions.push({
       dispose: () => this.stopPeriodicSync(),
     });
   }
 
-  /**
-   * Stop the periodic sync timer.
-   */
   stopPeriodicSync(): void {
     if (this.syncTimer) {
       clearInterval(this.syncTimer);
@@ -690,13 +779,11 @@ export class SyncEngine {
 
   // ─── Reset ────────────────────────────────────────────────────────────────
 
-  /**
-   * Reset all local sync state. Does NOT delete the remote repo.
-   */
   async resetSyncState(): Promise<void> {
     this.passphrase = null;
     await this.context.secrets.delete('syncPassphrase');
     await this.context.globalState.update('syncState', undefined);
+    await this.context.globalState.update('sessionHashCache', undefined);
     await this.context.globalState.update('deviceId', undefined);
     this.stopPeriodicSync();
     this.updateStatus('setup-required');
@@ -707,13 +794,13 @@ export class SyncEngine {
 
   private log(message: string): void {
     const timestamp = new Date().toISOString();
-    this.outputChannel.appendLine(`[${timestamp}] ${message}`);
+    this.outputChannel.appendLine('[' + timestamp + '] ' + message);
   }
 
   private logError(message: string, err: unknown): void {
     const timestamp = new Date().toISOString();
     const errorStr = err instanceof Error ? err.message : String(err);
-    this.outputChannel.appendLine(`[${timestamp}] ERROR: ${message}: ${errorStr}`);
+    this.outputChannel.appendLine('[' + timestamp + '] ERROR: ' + message + ': ' + errorStr);
   }
 
   // ─── Dispose ──────────────────────────────────────────────────────────────

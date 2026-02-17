@@ -3,21 +3,40 @@ import * as path from 'path';
 import * as os from 'os';
 import type {
   CopilotSession,
-  SessionIndexEntry,
   SessionStoreIndex,
 } from './types';
 
 /**
- * Reads and writes Copilot chat sessions from/to VS Code's local storage.
+ * Minimal metadata about a session — no raw content loaded.
+ * Used for change-detection without reading full file bodies.
+ */
+export interface SessionMetadata {
+  id: string;
+  workspaceId: string;
+  workspacePath: string;
+  fileExtension: string;
+  /** File modification time (epoch ms) */
+  mtimeMs: number;
+  /** File size in bytes */
+  sizeBytes: number;
+  /** Full path to the session file on disk */
+  filePath: string;
+  /** Extracted from minimal parse or file name */
+  customTitle: string;
+  creationDate: number;
+  lastMessageDate: number;
+}
+
+/**
+ * Reads Copilot chat sessions from the local VS Code storage.
  *
  * Sessions are stored under:
- *   <userDataDir>/User/workspaceStorage/<workspaceId>/
- *     - state.vscdb  (SQLite DB with session index)
- *     - chatSessions/<sessionId>.json   (old format — single JSON object)
- *     - chatSessions/<sessionId>.jsonl  (new format — append-only JSONL log)
+ *   <userDataDir>/User/workspaceStorage/<workspaceId>/chatSessions/
+ *     - <sessionId>.json   (legacy single-object format)
+ *     - <sessionId>.jsonl  (append-only log format — kind 0/1/2 entries)
  *
- * Files are treated as opaque blobs — we never parse or re-serialize session
- * content. This preserves both the old `.json` and new `.jsonl` formats exactly.
+ * Files are treated as **opaque blobs**: we never parse/re-serialize them
+ * to avoid corrupting the append-only log structure.
  */
 export class SessionReader {
   private userDataDir: string;
@@ -32,7 +51,6 @@ export class SessionReader {
     const platform = process.platform;
     const home = os.homedir();
 
-    // Check for VS Code Insiders first, then stable
     const variants = ['Code - Insiders', 'Code'];
 
     for (const variant of variants) {
@@ -55,7 +73,6 @@ export class SessionReader {
       }
     }
 
-    // Default to stable path even if it doesn't exist yet
     switch (platform) {
       case 'linux':
         return path.join(home, '.config', 'Code');
@@ -74,9 +91,6 @@ export class SessionReader {
     return path.join(this.userDataDir, 'User', 'workspaceStorage');
   }
 
-  /**
-   * List all workspace IDs that contain chat sessions.
-   */
   async listWorkspaceIds(): Promise<string[]> {
     const storageDir = this.workspaceStorageDir;
     if (!fs.existsSync(storageDir)) {
@@ -97,9 +111,6 @@ export class SessionReader {
     return workspaceIds;
   }
 
-  /**
-   * Read the workspace.json to get the actual workspace folder path.
-   */
   async getWorkspacePath(workspaceId: string): Promise<string> {
     const wsJsonPath = path.join(this.workspaceStorageDir, workspaceId, 'workspace.json');
     try {
@@ -109,15 +120,12 @@ export class SessionReader {
       if (uri.startsWith('file://')) {
         return decodeURIComponent(uri.replace('file://', ''));
       }
-      return uri || `unknown-workspace-${workspaceId}`;
+      return uri || 'unknown-workspace-' + workspaceId;
     } catch {
-      return `unknown-workspace-${workspaceId}`;
+      return 'unknown-workspace-' + workspaceId;
     }
   }
 
-  /**
-   * Build a map of workspace path → local workspace ID.
-   */
   async buildWorkspacePathMap(): Promise<Map<string, string>> {
     const storageDir = this.workspaceStorageDir;
     const pathMap = new Map<string, string>();
@@ -138,18 +146,13 @@ export class SessionReader {
     return pathMap;
   }
 
-  /**
-   * Find the local workspace ID for a given workspace path.
-   */
   async findLocalWorkspaceId(workspacePath: string): Promise<string | null> {
     const pathMap = await this.buildWorkspacePathMap();
 
-    // Exact match
     if (pathMap.has(workspacePath)) {
       return pathMap.get(workspacePath)!;
     }
 
-    // Try matching by folder name for cross-platform compatibility
     const targetFolderName = path.basename(workspacePath);
     for (const [wsPath, wsId] of pathMap) {
       if (path.basename(wsPath) === targetFolderName) {
@@ -160,51 +163,36 @@ export class SessionReader {
     return null;
   }
 
-  /**
-   * Get the workspace ID of the currently open workspace in VS Code.
-   */
   async getCurrentWorkspaceId(): Promise<string | null> {
-    const vscode = require('vscode');
-    const workspaceFolders = vscode.workspace?.workspaceFolders;
+    const workspaceFolders = require('vscode').workspace?.workspaceFolders;
     if (!workspaceFolders || workspaceFolders.length === 0) {
       return null;
     }
-
     const currentPath = workspaceFolders[0].uri.fsPath;
     return this.findLocalWorkspaceId(currentPath);
   }
 
-  // ─── Session File Discovery ───────────────────────────────────────────────
-
-  /**
-   * Scan the chatSessions directory for both .json and .jsonl files.
-   */
-  private async scanChatSessionFiles(chatDir: string): Promise<{ id: string; ext: string }[]> {
-    if (!fs.existsSync(chatDir)) {
-      return [];
-    }
-
-    const files = await fs.promises.readdir(chatDir);
-    const results: { id: string; ext: string }[] = [];
-
-    for (const f of files) {
-      if (f.endsWith('.jsonl')) {
-        results.push({ id: f.replace('.jsonl', ''), ext: '.jsonl' });
-      } else if (f.endsWith('.json')) {
-        results.push({ id: f.replace('.json', ''), ext: '.json' });
-      }
-    }
-
-    return results;
-  }
-
   // ─── Session Index (SQLite) ───────────────────────────────────────────────
 
-  /**
-   * Read the session index from state.vscdb.
-   * Returns entries as a dict keyed by session ID.
-   */
-  private async readSessionIndexFromDb(dbPath: string): Promise<Record<string, SessionIndexEntry>> {
+  async getSessionIndex(workspaceId: string): Promise<string[]> {
+    const chatDir = path.join(this.workspaceStorageDir, workspaceId, 'chatSessions');
+
+    try {
+      const dbPath = path.join(this.workspaceStorageDir, workspaceId, 'state.vscdb');
+      if (fs.existsSync(dbPath)) {
+        const sessionIds = await this.readSessionIndexFromDb(dbPath);
+        if (sessionIds.length > 0) {
+          return sessionIds;
+        }
+      }
+    } catch (err) {
+      console.warn('[Copilot Session Sync] SQLite read failed for ' + workspaceId + ':', err);
+    }
+
+    return this.scanChatSessionFiles(chatDir);
+  }
+
+  private async readSessionIndexFromDb(dbPath: string): Promise<string[]> {
     try {
       const Database = require('better-sqlite3');
       const db = new Database(dbPath, { readonly: true, fileMustExist: true });
@@ -215,136 +203,138 @@ export class SessionReader {
         ).get() as { value: string } | undefined;
 
         if (!row?.value) {
-          return {};
+          return [];
         }
 
-        const index = JSON.parse(row.value);
+        const index: SessionStoreIndex = JSON.parse(row.value);
 
-        // Handle both old format (array) and new format (dict)
+        // Handle dict format: entries is Record<string, SessionIndexEntry>
+        if (index.entries && typeof index.entries === 'object' && !Array.isArray(index.entries)) {
+          return Object.keys(index.entries);
+        }
+
+        // Handle old array format for backwards compat
         if (Array.isArray(index.entries)) {
-          const result: Record<string, SessionIndexEntry> = {};
-          for (const e of index.entries) {
-            if (e.sessionId) {
-              result[e.sessionId] = {
-                sessionId: e.sessionId,
-                title: e.title ?? 'Untitled',
-                lastMessageDate: 0,
-                timing: { created: 0, lastRequestStarted: 0, lastRequestEnded: 0 },
-                initialLocation: 'panel',
-                hasPendingEdits: false,
-                isEmpty: false,
-                isExternal: false,
-                lastResponseState: 0,
-              };
-            }
-          }
-          return result;
+          return (index.entries as any[]).map((e: any) => e.sessionId).filter(Boolean);
         }
 
-        // New format: entries is a Record<string, SessionIndexEntry>
-        return index.entries ?? {};
+        return [];
       } finally {
         db.close();
       }
     } catch (err) {
       console.warn('[Copilot Session Sync] Could not read state.vscdb:', err);
-      return {};
+      return [];
     }
   }
 
-  // ─── Session Reading ──────────────────────────────────────────────────────
+  private async scanChatSessionFiles(chatDir: string): Promise<string[]> {
+    if (!fs.existsSync(chatDir)) {
+      return [];
+    }
+
+    const files = await fs.promises.readdir(chatDir);
+    return files
+      .filter((f) => f.endsWith('.json') || f.endsWith('.jsonl'))
+      .map((f) => f.replace(/\.(json|jsonl)$/, ''));
+  }
+
+  private resolveSessionFilePath(workspaceId: string, sessionId: string): { filePath: string; ext: string } | null {
+    const chatDir = path.join(this.workspaceStorageDir, workspaceId, 'chatSessions');
+    for (const ext of ['.jsonl', '.json']) {
+      const filePath = path.join(chatDir, sessionId + ext);
+      if (fs.existsSync(filePath)) {
+        return { filePath, ext };
+      }
+    }
+    return null;
+  }
+
+  // ─── Session Reading (Opaque Blob) ────────────────────────────────────────
 
   /**
-   * Read a single session file as raw content (opaque blob).
+   * Read metadata about a session without loading its raw content.
+   * Used for fast change-detection (compare mtime + size against cached hashes).
    */
-  async readSession(
-    workspaceId: string,
-    sessionId: string,
-    fileExt: string,
-    indexEntry?: SessionIndexEntry
-  ): Promise<CopilotSession | null> {
-    const sessionPath = path.join(
-      this.workspaceStorageDir,
-      workspaceId,
-      'chatSessions',
-      `${sessionId}${fileExt}`
-    );
+  async readSessionMetadata(workspaceId: string, sessionId: string): Promise<SessionMetadata | null> {
+    const resolved = this.resolveSessionFilePath(workspaceId, sessionId);
+    if (!resolved) {
+      return null;
+    }
 
     try {
-      const rawContent = await fs.promises.readFile(sessionPath, 'utf-8');
+      const stat = await fs.promises.stat(resolved.filePath);
       const workspacePath = await this.getWorkspacePath(workspaceId);
-
-      // Extract metadata from the index if available
-      let title = 'Untitled';
-      let creationDate = 0;
-      let lastMessageDate = 0;
-
-      if (indexEntry) {
-        title = indexEntry.title || 'Untitled';
-        lastMessageDate = indexEntry.lastMessageDate || 0;
-        creationDate = indexEntry.timing?.created || 0;
-      } else {
-        // Try to extract minimal metadata from the file content
-        const meta = this.extractMetadataFromFile(rawContent, fileExt);
-        title = meta.title;
-        creationDate = meta.creationDate;
-        lastMessageDate = meta.lastMessageDate;
-      }
+      const meta = this.extractMinimalMetadata(resolved.filePath, resolved.ext);
 
       return {
         id: sessionId,
         workspaceId,
         workspacePath,
-        fileExtension: fileExt,
-        rawContent,
-        customTitle: title,
-        creationDate,
-        lastMessageDate,
+        fileExtension: resolved.ext,
+        mtimeMs: stat.mtimeMs,
+        sizeBytes: stat.size,
+        filePath: resolved.filePath,
+        customTitle: meta.customTitle,
+        creationDate: meta.creationDate,
+        lastMessageDate: meta.lastMessageDate,
       };
     } catch (err) {
-      console.warn(`[Copilot Session Sync] Failed to read session ${sessionId}:`, err);
+      console.warn('[Copilot Session Sync] Failed to stat session ' + sessionId + ':', err);
       return null;
     }
   }
 
   /**
-   * Extract minimal metadata from a session file without full parsing.
+   * Read the raw content of a specific session file.
    */
-  private extractMetadataFromFile(
-    content: string,
-    ext: string
-  ): { title: string; creationDate: number; lastMessageDate: number } {
-    try {
-      if (ext === '.jsonl') {
-        // JSONL: first line is kind:0 with initial state in "v"
-        const firstNewline = content.indexOf('\n');
-        const firstLine = firstNewline > 0 ? content.substring(0, firstNewline) : content;
-        const obj = JSON.parse(firstLine);
-        if (obj.kind === 0 && obj.v) {
-          return {
-            title: obj.v.customTitle ?? 'Untitled',
-            creationDate: obj.v.creationDate ?? 0,
-            lastMessageDate: obj.v.lastMessageDate ?? obj.v.creationDate ?? 0,
-          };
-        }
-      } else {
-        // JSON: parse the full object
-        const obj = JSON.parse(content);
-        return {
-          title: obj.customTitle ?? 'Untitled',
-          creationDate: obj.creationDate ?? 0,
-          lastMessageDate: obj.lastMessageDate ?? 0,
-        };
-      }
-    } catch {
-      // Ignore parse errors
+  async readSessionContent(workspaceId: string, sessionId: string): Promise<string | null> {
+    const resolved = this.resolveSessionFilePath(workspaceId, sessionId);
+    if (!resolved) {
+      return null;
     }
-
-    return { title: 'Untitled', creationDate: 0, lastMessageDate: 0 };
+    try {
+      return await fs.promises.readFile(resolved.filePath, 'utf-8');
+    } catch {
+      return null;
+    }
   }
 
   /**
-   * Read all sessions from all workspaces as raw blobs.
+   * Read a single session as an opaque blob (metadata + raw content).
+   */
+  async readSession(workspaceId: string, sessionId: string): Promise<CopilotSession | null> {
+    const resolved = this.resolveSessionFilePath(workspaceId, sessionId);
+    if (!resolved) {
+      return null;
+    }
+
+    try {
+      const [content, workspacePath] = await Promise.all([
+        fs.promises.readFile(resolved.filePath, 'utf-8'),
+        this.getWorkspacePath(workspaceId),
+      ]);
+
+      const meta = this.extractMinimalMetadata(resolved.filePath, resolved.ext);
+
+      return {
+        id: sessionId,
+        workspaceId,
+        workspacePath,
+        fileExtension: resolved.ext,
+        rawContent: content,
+        customTitle: meta.customTitle,
+        creationDate: meta.creationDate,
+        lastMessageDate: meta.lastMessageDate,
+      };
+    } catch (err) {
+      console.warn('[Copilot Session Sync] Failed to read session ' + sessionId + ':', err);
+      return null;
+    }
+  }
+
+  /**
+   * Read all sessions from all workspaces as opaque blobs.
    */
   async readAllSessions(excludedWorkspaces: string[] = []): Promise<CopilotSession[]> {
     const workspaceIds = await this.listWorkspaceIds();
@@ -352,29 +342,13 @@ export class SessionReader {
 
     for (const wsId of workspaceIds) {
       const wsPath = await this.getWorkspacePath(wsId);
-
-      // Check if excluded
       if (excludedWorkspaces.some((excluded) => wsPath.startsWith(excluded))) {
         continue;
       }
 
-      // Try to read the index from state.vscdb for metadata
-      const dbPath = path.join(this.workspaceStorageDir, wsId, 'state.vscdb');
-      let indexEntries: Record<string, SessionIndexEntry> = {};
-      try {
-        if (fs.existsSync(dbPath)) {
-          indexEntries = await this.readSessionIndexFromDb(dbPath);
-        }
-      } catch {
-        // Fall back to file-level metadata extraction
-      }
-
-      // Scan the chatSessions directory for actual files
-      const chatDir = path.join(this.workspaceStorageDir, wsId, 'chatSessions');
-      const files = await this.scanChatSessionFiles(chatDir);
-
-      for (const { id, ext } of files) {
-        const session = await this.readSession(wsId, id, ext, indexEntries[id]);
+      const sessionIds = await this.getSessionIndex(wsId);
+      for (const sessionId of sessionIds) {
+        const session = await this.readSession(wsId, sessionId);
         if (session) {
           sessions.push(session);
         }
@@ -385,28 +359,51 @@ export class SessionReader {
   }
 
   /**
-   * Read all sessions, filtered by max age in days.
+   * Read all session metadata (no raw content) from all workspaces.
+   * Much faster than readAllSessions for change-detection.
    */
+  async readAllSessionMetadata(excludedWorkspaces: string[] = []): Promise<SessionMetadata[]> {
+    const workspaceIds = await this.listWorkspaceIds();
+    const metadataList: SessionMetadata[] = [];
+
+    for (const wsId of workspaceIds) {
+      const wsPath = await this.getWorkspacePath(wsId);
+      if (excludedWorkspaces.some((excluded) => wsPath.startsWith(excluded))) {
+        continue;
+      }
+
+      const sessionIds = await this.getSessionIndex(wsId);
+      for (const sessionId of sessionIds) {
+        const meta = await this.readSessionMetadata(wsId, sessionId);
+        if (meta) {
+          metadataList.push(meta);
+        }
+      }
+    }
+
+    return metadataList;
+  }
+
   async readRecentSessions(
     maxAgeDays: number,
     excludedWorkspaces: string[] = []
   ): Promise<CopilotSession[]> {
     const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
     const all = await this.readAllSessions(excludedWorkspaces);
-    return all.filter((s) => {
-      // If we have no date info, include the session
-      if (s.lastMessageDate === 0 && s.creationDate === 0) {
-        return true;
-      }
-      return (s.lastMessageDate || s.creationDate) >= cutoff;
-    });
+    return all.filter((s) => s.lastMessageDate >= cutoff);
+  }
+
+  async readRecentSessionMetadata(
+    maxAgeDays: number,
+    excludedWorkspaces: string[] = []
+  ): Promise<SessionMetadata[]> {
+    const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
+    const all = await this.readAllSessionMetadata(excludedWorkspaces);
+    return all.filter((m) => m.lastMessageDate >= cutoff);
   }
 
   // ─── Write Session (for importing from remote) ────────────────────────────
 
-  /**
-   * Write a session's raw content to the local chatSessions directory.
-   */
   async writeSession(session: CopilotSession): Promise<void> {
     const chatDir = path.join(
       this.workspaceStorageDir,
@@ -414,17 +411,13 @@ export class SessionReader {
       'chatSessions'
     );
 
-    // Ensure the directory exists
     await fs.promises.mkdir(chatDir, { recursive: true });
 
-    const sessionPath = path.join(chatDir, `${session.id}${session.fileExtension}`);
+    const ext = session.fileExtension || '.jsonl';
+    const sessionPath = path.join(chatDir, session.id + ext);
     await fs.promises.writeFile(sessionPath, session.rawContent, 'utf-8');
   }
 
-  /**
-   * Update the session index in state.vscdb to include a new session.
-   * Uses the real VS Code format: {version: 1, entries: {id: {...}}}
-   */
   async addToSessionIndex(workspaceId: string, session: CopilotSession): Promise<void> {
     const dbPath = path.join(this.workspaceStorageDir, workspaceId, 'state.vscdb');
 
@@ -439,42 +432,90 @@ export class SessionReader {
 
         let index: SessionStoreIndex = { version: 1, entries: {} };
         if (row?.value) {
-          const parsed = JSON.parse(row.value);
-          if (Array.isArray(parsed.entries)) {
-            // Migrate old array format to new dict format
-            index = { version: 1, entries: {} };
-          } else {
-            index = parsed;
+          try {
+            index = JSON.parse(row.value);
+          } catch {
+            // Corrupted index — start fresh
           }
         }
 
-        const now = Date.now();
+        if (!index.entries || typeof index.entries !== 'object' || Array.isArray(index.entries)) {
+          index.entries = {};
+        }
 
-        // Add or update the entry using the real VS Code format
-        index.entries[session.id] = {
-          sessionId: session.id,
-          title: session.customTitle || 'Synced Session',
-          lastMessageDate: session.lastMessageDate || now,
-          timing: {
-            created: session.creationDate || now,
-            lastRequestStarted: session.lastMessageDate || now,
-            lastRequestEnded: session.lastMessageDate || now,
-          },
-          initialLocation: 'panel',
-          hasPendingEdits: false,
-          isEmpty: false,
-          isExternal: false,
-          lastResponseState: 2,
-        };
+        if (!index.entries[session.id]) {
+          index.entries[session.id] = {
+            sessionId: session.id,
+            title: session.customTitle,
+            lastMessageDate: session.lastMessageDate,
+            timing: {
+              created: session.creationDate,
+              lastRequestStarted: session.lastMessageDate,
+              lastRequestEnded: session.lastMessageDate,
+            },
+            initialLocation: 'panel',
+            hasPendingEdits: false,
+            isEmpty: false,
+            isExternal: false,
+            lastResponseState: 0,
+          };
 
-        db.prepare(
-          "INSERT OR REPLACE INTO ItemTable (key, value) VALUES ('chat.ChatSessionStore.index', ?)"
-        ).run(JSON.stringify(index));
+          db.prepare(
+            "INSERT OR REPLACE INTO ItemTable (key, value) VALUES ('chat.ChatSessionStore.index', ?)"
+          ).run(JSON.stringify(index));
+        }
       } finally {
         db.close();
       }
     } catch (err) {
-      console.warn(`[Copilot Session Sync] Failed to update session index for ${workspaceId}:`, err);
+      console.warn('[Copilot Session Sync] Failed to update session index for ' + workspaceId + ':', err);
     }
+  }
+
+  // ─── Minimal Metadata Extraction ──────────────────────────────────────────
+
+  private extractMinimalMetadata(
+    filePath: string,
+    ext: string
+  ): { customTitle: string; creationDate: number; lastMessageDate: number } {
+    const defaults = { customTitle: 'Untitled Session', creationDate: 0, lastMessageDate: 0 };
+
+    try {
+      if (ext === '.jsonl') {
+        const fd = fs.openSync(filePath, 'r');
+        try {
+          const buf = Buffer.alloc(8192);
+          const bytesRead = fs.readSync(fd, buf, 0, buf.length, 0);
+          const chunk = buf.toString('utf-8', 0, bytesRead);
+          const firstNewline = chunk.indexOf('\n');
+          const firstLine = firstNewline >= 0 ? chunk.substring(0, firstNewline) : chunk;
+
+          if (firstLine.trim()) {
+            const entry = JSON.parse(firstLine);
+            if (entry.kind === 0 && entry.value) {
+              return {
+                customTitle: entry.value.customTitle ?? defaults.customTitle,
+                creationDate: entry.value.creationDate ?? defaults.creationDate,
+                lastMessageDate: entry.value.lastMessageDate ?? defaults.lastMessageDate,
+              };
+            }
+          }
+        } finally {
+          fs.closeSync(fd);
+        }
+      } else {
+        const content = fs.readFileSync(filePath, 'utf-8');
+        const raw = JSON.parse(content);
+        return {
+          customTitle: raw.customTitle ?? defaults.customTitle,
+          creationDate: raw.creationDate ?? defaults.creationDate,
+          lastMessageDate: raw.lastMessageDate ?? defaults.lastMessageDate,
+        };
+      }
+    } catch {
+      // Metadata extraction is best-effort
+    }
+
+    return defaults;
   }
 }
