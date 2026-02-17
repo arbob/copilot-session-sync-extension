@@ -21,7 +21,7 @@
   "icon": "icon.png",
   "repository": {
     "type": "git",
-    "url": ""
+    "url": "https://github.com/arbob/copilot-session-sync-extension"
   },
   "activationEvents": [
     "onStartupFinished"

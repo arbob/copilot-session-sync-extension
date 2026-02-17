@@ -1,5 +1,8 @@
 # Copilot Session Sync
 
+[![VS Code Marketplace](https://img.shields.io/visual-studio-marketplace/v/arbob.copilot-session-sync)](https://marketplace.visualstudio.com/items?itemName=arbob.copilot-session-sync)
+[![GitHub](https://img.shields.io/github/license/arbob/copilot-session-sync-extension)](https://github.com/arbob/copilot-session-sync-extension)
+
 Sync your GitHub Copilot chat sessions across all your devices, securely and automatically.
 
 ## Features
@@ -10,6 +13,10 @@ Sync your GitHub Copilot chat sessions across all your devices, securely and aut
 - **Automatic sync** — Pulls on startup and pushes periodically (configurable interval)
 - **Per-workspace control** — Exclude specific workspaces from syncing
 - **Conflict resolution** — Last-write-wins with automatic backups of overwritten versions
+
+## Install
+
+Install from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=arbob.copilot-session-sync) or search **"Copilot Session Sync"** in VS Code Extensions.
 
 ## Getting Started
 
@@ -77,4 +84,4 @@ Sync your GitHub Copilot chat sessions across all your devices, securely and aut
 
 ## License
 
-MIT
+[MIT](https://github.com/arbob/copilot-session-sync-extension/blob/main/LICENSE)
