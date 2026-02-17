@@ -273,7 +273,7 @@ export class SyncEngine {
       } else {
         // Verify stored passphrase against remote token (if exists)
         const verificationToken = await this.githubRepo.getFileContent('verification.token');
-        if (verificationToken && !Encryption.verifyPassphrase(this.passphrase!, verificationToken)) {
+        if (verificationToken && (!this.passphrase || !Encryption.verifyPassphrase(this.passphrase, verificationToken))) {
           vscode.window.showWarningMessage(
             'Stored passphrase no longer matches the remote verification. Please re-enter your passphrase.'
           );
@@ -614,13 +614,17 @@ export class SyncEngine {
   // ─── Manifest Management ─────────────────────────────────────────────────
 
   private async getRemoteManifest(): Promise<SyncManifest | null> {
+    if (!this.passphrase) {
+      return null;
+    }
+
     const content = await this.githubRepo.getFileContent('manifest.json');
     if (!content) {
       return null;
     }
 
     try {
-      const decrypted = Encryption.decryptFromString(content, this.passphrase!);
+      const decrypted = Encryption.decryptFromString(content, this.passphrase);
       return JSON.parse(decrypted) as SyncManifest;
     } catch (err) {
       this.logError('Failed to decrypt remote manifest', err);

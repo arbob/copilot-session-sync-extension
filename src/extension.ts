@@ -163,11 +163,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
 export function deactivate(): void {
   if (syncEngine) {
-    // Run a final push sync before deactivation
-    // Note: deactivate should be fast, so we fire-and-forget
-    syncEngine.sync().catch(() => {
-      // Best effort — can't do much if this fails during shutdown
-    });
+    // Only attempt final sync if engine is in a ready state
+    if (syncEngine.status.status === 'idle') {
+      syncEngine.sync().catch(() => {
+        // Best effort — can't do much if this fails during shutdown
+      });
+    }
     syncEngine.dispose();
   }
 }
