@@ -512,6 +512,53 @@ export class SessionReader {
     }
   }
 
+  /**
+   * Re-index all session files in a workspace.
+   * Scans the chatSessions folder and ensures all files are in VS Code's session indices.
+   * Returns the number of sessions processed.
+   */
+  async reindexWorkspace(workspaceId: string): Promise<number> {
+    const chatDir = path.join(this.workspaceStorageDir, workspaceId, 'chatSessions');
+
+    if (!fs.existsSync(chatDir)) {
+      return 0;
+    }
+
+    const files = fs.readdirSync(chatDir).filter(
+      (f: string) => f.endsWith('.json') || f.endsWith('.jsonl')
+    );
+
+    let count = 0;
+    for (const file of files) {
+      try {
+        const ext = path.extname(file) as '.json' | '.jsonl';
+        const sessionId = path.basename(file, ext);
+        const filePath = path.join(chatDir, file);
+
+        const content = fs.readFileSync(filePath, 'utf-8');
+        const meta = this.extractMinimalMetadata(filePath, ext);
+
+        const session: CopilotSession = {
+          id: sessionId,
+          workspaceId: workspaceId,
+          workspacePath: '',
+          fileExtension: ext,
+          rawContent: content,
+          customTitle: meta.customTitle,
+          creationDate: meta.creationDate,
+          lastMessageDate: meta.lastMessageDate,
+        };
+
+        await this.addToSessionIndex(workspaceId, session);
+        count++;
+      } catch (err) {
+        console.warn('[Copilot Session Sync] Failed to reindex session file ' + file + ':', err);
+      }
+    }
+
+    return count;
+  }
+
   // ─── Minimal Metadata Extraction ──────────────────────────────────────────
 
   private extractMinimalMetadata(
