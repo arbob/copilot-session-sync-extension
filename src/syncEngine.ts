@@ -408,6 +408,7 @@ export class SyncEngine {
 
   /**
    * Pull a single session from the remote.
+   * Maps the remote workspace ID to the local workspace ID based on workspace path.
    */
   private async pullSession(sessionId: string, entry: SyncManifestEntry): Promise<void> {
     const encryptedContent = await this.githubRepo.getFileContent(`sessions/${sessionId}.enc`);
@@ -419,6 +420,26 @@ export class SyncEngine {
     // Decrypt
     const decrypted = Encryption.decryptFromString(encryptedContent, this.passphrase!);
     const session: CopilotSession = JSON.parse(decrypted);
+
+    // Map the remote workspace ID to the local workspace ID
+    // The workspace ID is unique per VS Code installation, so we match by workspace path
+    const localWorkspaceId = await this.sessionReader.findLocalWorkspaceId(session.workspacePath);
+
+    if (localWorkspaceId) {
+      // Found a matching local workspace — write the session there
+      this.log(`Mapped remote workspace "${session.workspacePath}" to local ID: ${localWorkspaceId}`);
+      session.workspaceId = localWorkspaceId;
+    } else {
+      // No matching local workspace found — try the currently open workspace as fallback
+      const currentWsId = await this.sessionReader.getCurrentWorkspaceId();
+      if (currentWsId) {
+        this.log(`No local workspace match for "${session.workspacePath}" — writing to current workspace: ${currentWsId}`);
+        session.workspaceId = currentWsId;
+      } else {
+        this.log(`No matching workspace found for "${session.workspacePath}" — skipping session "${session.customTitle}". Open that workspace folder first.`);
+        return;
+      }
+    }
 
     // Write to local storage
     await this.sessionReader.writeSession(session);

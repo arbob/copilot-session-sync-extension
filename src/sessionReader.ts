@@ -116,6 +116,69 @@ export class SessionReader {
     }
   }
 
+  /**
+   * Build a map of workspace path → local workspace ID.
+   * Used to find the correct local workspace ID when pulling sessions from another device.
+   */
+  async buildWorkspacePathMap(): Promise<Map<string, string>> {
+    const storageDir = this.workspaceStorageDir;
+    const pathMap = new Map<string, string>();
+
+    if (!fs.existsSync(storageDir)) {
+      return pathMap;
+    }
+
+    const entries = await fs.promises.readdir(storageDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) {continue;}
+      const wsPath = await this.getWorkspacePath(entry.name);
+      if (!wsPath.startsWith('unknown-workspace-')) {
+        pathMap.set(wsPath, entry.name);
+      }
+    }
+
+    return pathMap;
+  }
+
+  /**
+   * Find the local workspace ID for a given workspace path.
+   * If no matching workspace exists locally, returns null.
+   */
+  async findLocalWorkspaceId(workspacePath: string): Promise<string | null> {
+    const pathMap = await this.buildWorkspacePathMap();
+
+    // Exact match
+    if (pathMap.has(workspacePath)) {
+      return pathMap.get(workspacePath)!;
+    }
+
+    // Try matching by folder name (last path component) for cross-platform compatibility
+    const targetFolderName = path.basename(workspacePath);
+    for (const [wsPath, wsId] of pathMap) {
+      if (path.basename(wsPath) === targetFolderName) {
+        return wsId;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Get the workspace ID of the currently open workspace in VS Code.
+   * Falls back to scanning workspace storage if the API doesn't provide it.
+   */
+  async getCurrentWorkspaceId(): Promise<string | null> {
+    // VS Code doesn't expose workspace storage ID directly,
+    // but we can match by the currently open folder path
+    const workspaceFolders = require('vscode').workspace?.workspaceFolders;
+    if (!workspaceFolders || workspaceFolders.length === 0) {
+      return null;
+    }
+
+    const currentPath = workspaceFolders[0].uri.fsPath;
+    return this.findLocalWorkspaceId(currentPath);
+  }
+
   // ─── Session Index (SQLite) ───────────────────────────────────────────────
 
   /**
