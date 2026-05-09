@@ -541,6 +541,7 @@ export class SyncEngine {
 
     // 1. Read only metadata from ALL workspaces (fast — no file content loaded)
     const allMetadata = await this.sessionReader.readRecentSessionMetadata(maxAgeDays);
+    this.log('Found ' + allMetadata.length + ' local sessions within ' + maxAgeDays + ' day(s).');
 
     // Filter out oversized sessions
     const metadata = allMetadata.filter((m) => {
@@ -697,44 +698,78 @@ export class SyncEngine {
       return;
     }
 
-    // 8. Update and encrypt manifest (uses the cached encryptor too)
+    // 8. Update and encrypt manifest
     manifest.lastSyncTimestamp = Date.now();
     manifest.deviceId = this.getDeviceId();
-
     const manifestEncrypted = encryptor.encryptToString(JSON.stringify(manifest));
 
-    filesToPush.push({
-      path: 'manifest.json',
-      content: manifestEncrypted,
-    });
-
-    filesToPush.push(...backupFiles);
-
-    // 9. Batch commit to GitHub
-    const pushCount = filesToPush.length - 1 - backupFiles.length;
+    const pushCount = filesToPush.length;
     if (progress) {
       progress.report({ message: 'Uploading ' + pushCount + ' session(s)...' });
     }
 
-    try {
-      await this.githubRepo.batchCommit(
-        filesToPush,
-        [],
-        'sync: Push ' + pushCount + ' session(s) from ' + this.getDeviceId()
-      );
-      this.log('Push complete: ' + pushCount + ' sessions pushed.');
-    } catch (err) {
-      this.log('Batch commit failed, falling back to individual file operations...');
-      for (const file of filesToPush) {
-        await this.githubRepo.putFile(
-          file.path,
-          file.content,
-          'sync: Update ' + file.path
+    // 9. Commit session files in chunks to avoid GitHub tree API payload limits.
+    //    Then commit manifest + backups as a final separate commit.
+    //    GitHub's tree API rejects requests with inline content > ~25 MB total.
+    const CHUNK_SIZE = 25;
+    const deviceId = this.getDeviceId();
+    let chunkIndex = 0;
+
+    for (let i = 0; i < filesToPush.length; i += CHUNK_SIZE) {
+      const chunk = filesToPush.slice(i, i + CHUNK_SIZE);
+      chunkIndex++;
+      const chunkLabel = filesToPush.length > CHUNK_SIZE
+        ? ` (chunk ${chunkIndex}/${Math.ceil(filesToPush.length / CHUNK_SIZE)})`
+        : '';
+
+      try {
+        await this.githubRepo.batchCommit(
+          chunk,
+          [],
+          'sync: Push ' + chunk.length + ' session(s) from ' + deviceId + chunkLabel
         );
+        this.log('Committed chunk ' + chunkIndex + ': ' + chunk.length + ' session(s).');
+      } catch (batchErr) {
+        this.log('Batch commit failed for chunk ' + chunkIndex + ', falling back to individual file operations...');
+        // Contents API limit: ~1 MB. Files above that go through blob API (putFileLarge).
+        const CONTENTS_API_MAX = 750_000; // conservative limit (base64 overhead)
+        for (const file of chunk) {
+          if (file.content.length > CONTENTS_API_MAX) {
+            const sizeMB = (file.content.length / 1024 / 1024).toFixed(1);
+            this.log('Large file (' + sizeMB + ' MB), uploading via blob API: ' + file.path);
+            try {
+              await this.githubRepo.putFileLarge(file.path, file.content, 'sync: Update ' + file.path);
+            } catch (largeErr) {
+              this.logError('Failed to upload large file ' + file.path + ' (' + sizeMB + ' MB)', largeErr);
+            }
+          } else {
+            try {
+              await this.githubRepo.putFile(file.path, file.content, 'sync: Update ' + file.path);
+            } catch (putErr) {
+              this.logError('Failed to push ' + file.path, putErr);
+            }
+          }
+        }
       }
-      this.log('Push complete (individual): ' + pushCount + ' sessions pushed.');
     }
 
+    // 10. Commit manifest + backup files as a final atomic commit
+    const metaFiles: { path: string; content: string }[] = [
+      { path: 'manifest.json', content: manifestEncrypted },
+      ...backupFiles,
+    ];
+    try {
+      await this.githubRepo.batchCommit(metaFiles, [], 'sync: Update manifest from ' + deviceId);
+    } catch (manifestErr) {
+      this.logError('Failed to commit manifest, attempting individual fallback', manifestErr);
+      try {
+        await this.githubRepo.putFile('manifest.json', manifestEncrypted, 'sync: Update manifest');
+      } catch (putErr) {
+        this.logError('Failed to update manifest', putErr);
+      }
+    }
+
+    this.log('Push complete: ' + pushCount + ' sessions pushed.');
     this._status.sessionCount = Object.keys(manifest.entries).length;
   }
 

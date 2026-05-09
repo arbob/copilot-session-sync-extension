@@ -299,11 +299,16 @@ export class GitHubRepo {
     // 3. Build tree entries
     const treeEntries: GitTreeEntry[] = [];
 
-    // Files to create/update — use inline content for smaller files,
-    // create blobs for larger ones
+    // Files to create/update — use inline content only for small files (<100 KB).
+    // Larger files go through the blob API to keep the tree request payload small.
+    // GitHub's tree API rejects requests whose total inline content exceeds ~25 MB.
+    //
+    // Each blob upload is wrapped individually: a failure on one large file skips
+    // only that file and does not abort the whole chunk.
+    const skippedPaths: string[] = [];
     for (const file of files) {
-      if (file.content.length < 500_000) {
-        // Inline content (< 500KB)
+      if (file.content.length < 100_000) {
+        // Inline content (< 100 KB)
         treeEntries.push({
           path: file.path,
           mode: '100644',
@@ -311,22 +316,35 @@ export class GitHubRepo {
           content: file.content,
         });
       } else {
-        // Create a blob for large files
-        const { data: blobData } = await this.request<{ sha: string }>(
-          'POST',
-          `/repos/${this.owner}/${this.repoName}/git/blobs`,
-          {
-            content: Buffer.from(file.content).toString('base64'),
-            encoding: 'base64',
-          }
-        );
-        treeEntries.push({
-          path: file.path,
-          mode: '100644',
-          type: 'blob',
-          sha: blobData.sha,
-        });
+        // Create a blob for larger files — isolated try/catch so one failure
+        // doesn't kill the entire chunk.
+        try {
+          const { data: blobData } = await this.request<{ sha: string }>(
+            'POST',
+            `/repos/${this.owner}/${this.repoName}/git/blobs`,
+            {
+              // file.content is already a base64 string (from encryptToString),
+              // so pass it as UTF-8 to avoid triple-encoding
+              content: file.content,
+              encoding: 'utf-8',
+            }
+          );
+          treeEntries.push({
+            path: file.path,
+            mode: '100644',
+            type: 'blob',
+            sha: blobData.sha,
+          });
+        } catch (blobErr: any) {
+          console.warn(`[batchCommit] blob upload failed for ${file.path} (${(file.content.length / 1024 / 1024).toFixed(1)} MB):`, blobErr?.message ?? blobErr);
+          skippedPaths.push(file.path);
+        }
       }
+    }
+
+    if (skippedPaths.length > 0 && treeEntries.length === 0 && deletePaths.length === 0) {
+      // Nothing left to commit — propagate as an error so the caller can fallback
+      throw new Error(`batchCommit: all ${skippedPaths.length} blob upload(s) failed, nothing to commit`);
     }
 
     // Files to delete — set sha to null (GitHub API convention)
@@ -392,6 +410,72 @@ export class GitHubRepo {
     }
 
     throw new Error('batchCommit: ref update failed after retries');
+  }
+
+  /**
+   * Upload a single large file via the Git blob API and a minimal tree commit.
+   * Use this instead of putFile when the content exceeds the Contents API limit (~1 MB).
+   *
+   * The method is safe to call concurrently because it retries ref conflicts.
+   */
+  async putFileLarge(filePath: string, content: string, message: string): Promise<string> {
+    // 1. Upload blob
+    const { data: blobData } = await this.request<{ sha: string }>(
+      'POST',
+      `/repos/${this.owner}/${this.repoName}/git/blobs`,
+      { content, encoding: 'utf-8' }
+    );
+
+    const maxRefRetries = 3;
+    for (let attempt = 1; attempt <= maxRefRetries; attempt++) {
+      // 2. Get current branch tip
+      const { data: refData } = await this.request<{ object: { sha: string } }>(
+        'GET',
+        `/repos/${this.owner}/${this.repoName}/git/ref/heads/${this.defaultBranch}`
+      );
+      const parentSha = refData.object.sha;
+
+      const { data: commitData } = await this.request<{ tree: { sha: string } }>(
+        'GET',
+        `/repos/${this.owner}/${this.repoName}/git/commits/${parentSha}`
+      );
+
+      // 3. Create a minimal tree pointing at the blob
+      const { data: treeData } = await this.request<{ sha: string }>(
+        'POST',
+        `/repos/${this.owner}/${this.repoName}/git/trees`,
+        {
+          base_tree: commitData.tree.sha,
+          tree: [{ path: filePath, mode: '100644', type: 'blob', sha: blobData.sha }],
+        }
+      );
+
+      // 4. Create commit
+      const { data: newCommit } = await this.request<{ sha: string }>(
+        'POST',
+        `/repos/${this.owner}/${this.repoName}/git/commits`,
+        { message, tree: treeData.sha, parents: [parentSha] }
+      );
+
+      // 5. Update ref (retry on conflict)
+      try {
+        await this.request(
+          'PATCH',
+          `/repos/${this.owner}/${this.repoName}/git/refs/heads/${this.defaultBranch}`,
+          { sha: newCommit.sha }
+        );
+        return newCommit.sha;
+      } catch (err: any) {
+        const isConflict = err?.httpStatus === 409 || err?.httpStatus === 422;
+        if (isConflict && attempt < maxRefRetries) {
+          await new Promise((r) => setTimeout(r, 500 * attempt));
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    throw new Error(`putFileLarge: ref update failed after ${maxRefRetries} retries`);
   }
 
   // ─── Directory Listing ────────────────────────────────────────────────────
