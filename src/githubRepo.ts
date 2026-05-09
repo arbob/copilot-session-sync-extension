@@ -299,11 +299,12 @@ export class GitHubRepo {
     // 3. Build tree entries
     const treeEntries: GitTreeEntry[] = [];
 
-    // Files to create/update — use inline content for smaller files,
-    // create blobs for larger ones
+    // Files to create/update — use inline content only for small files (<100 KB).
+    // Larger files go through the blob API to keep the tree request payload small.
+    // GitHub's tree API rejects requests whose total inline content exceeds ~25 MB.
     for (const file of files) {
-      if (file.content.length < 500_000) {
-        // Inline content (< 500KB)
+      if (file.content.length < 100_000) {
+        // Inline content (< 100 KB)
         treeEntries.push({
           path: file.path,
           mode: '100644',
@@ -311,13 +312,15 @@ export class GitHubRepo {
           content: file.content,
         });
       } else {
-        // Create a blob for large files
+        // Create a blob for larger files
         const { data: blobData } = await this.request<{ sha: string }>(
           'POST',
           `/repos/${this.owner}/${this.repoName}/git/blobs`,
           {
-            content: Buffer.from(file.content).toString('base64'),
-            encoding: 'base64',
+            // file.content is already a base64 string (from encryptToString),
+            // so pass it as UTF-8 to avoid triple-encoding
+            content: file.content,
+            encoding: 'utf-8',
           }
         );
         treeEntries.push({

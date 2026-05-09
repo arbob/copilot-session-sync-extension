@@ -230,8 +230,9 @@ export class SessionReader {
         sizeBytes: stat.size,
         filePath: resolved.filePath,
         customTitle: meta.customTitle,
-        creationDate: meta.creationDate,
-        lastMessageDate: meta.lastMessageDate,
+        // Fall back to mtime if the JSONL format doesn't carry these timestamps
+        creationDate: meta.creationDate || stat.birthtimeMs || stat.mtimeMs,
+        lastMessageDate: meta.lastMessageDate || stat.mtimeMs,
       };
     } catch (err) {
       console.warn('[Copilot Session Sync] Failed to stat session ' + sessionId + ':', err);
@@ -579,11 +580,13 @@ export class SessionReader {
 
           if (firstLine.trim()) {
             const entry = JSON.parse(firstLine);
-            if (entry.kind === 0 && entry.value) {
+            // Support both new format ('v') and old format ('value')
+            const payload = entry.v ?? entry.value;
+            if (entry.kind === 0 && payload) {
               return {
-                customTitle: entry.value.customTitle ?? defaults.customTitle,
-                creationDate: entry.value.creationDate ?? defaults.creationDate,
-                lastMessageDate: entry.value.lastMessageDate ?? defaults.lastMessageDate,
+                customTitle: payload.customTitle ?? defaults.customTitle,
+                creationDate: payload.creationDate ?? defaults.creationDate,
+                lastMessageDate: payload.lastMessageDate ?? defaults.lastMessageDate,
               };
             }
           }
