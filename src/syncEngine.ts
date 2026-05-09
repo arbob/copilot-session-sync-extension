@@ -731,19 +731,23 @@ export class SyncEngine {
         this.log('Committed chunk ' + chunkIndex + ': ' + chunk.length + ' session(s).');
       } catch (batchErr) {
         this.log('Batch commit failed for chunk ' + chunkIndex + ', falling back to individual file operations...');
-        // GitHub Contents API limit is 1 MB per file — skip files that are too large
+        // Contents API limit: ~1 MB. Files above that go through blob API (putFileLarge).
         const CONTENTS_API_MAX = 750_000; // conservative limit (base64 overhead)
         for (const file of chunk) {
           if (file.content.length > CONTENTS_API_MAX) {
-            this.log('Skipping ' + file.path + ' in fallback: encrypted size ' +
-              (file.content.length / 1024 / 1024).toFixed(1) + ' MB exceeds Contents API limit. ' +
-              'Reduce maxSessionSizeMB or the session will sync on the next run via blob API.');
-            continue;
-          }
-          try {
-            await this.githubRepo.putFile(file.path, file.content, 'sync: Update ' + file.path);
-          } catch (putErr) {
-            this.logError('Failed to push ' + file.path, putErr);
+            const sizeMB = (file.content.length / 1024 / 1024).toFixed(1);
+            this.log('Large file (' + sizeMB + ' MB), uploading via blob API: ' + file.path);
+            try {
+              await this.githubRepo.putFileLarge(file.path, file.content, 'sync: Update ' + file.path);
+            } catch (largeErr) {
+              this.logError('Failed to upload large file ' + file.path + ' (' + sizeMB + ' MB)', largeErr);
+            }
+          } else {
+            try {
+              await this.githubRepo.putFile(file.path, file.content, 'sync: Update ' + file.path);
+            } catch (putErr) {
+              this.logError('Failed to push ' + file.path, putErr);
+            }
           }
         }
       }
